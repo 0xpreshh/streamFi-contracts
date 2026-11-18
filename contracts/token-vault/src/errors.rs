@@ -47,4 +47,10 @@ pub enum Error {
     InvalidStreamBatch = 22,
     /// A stream query or withdrawal failed during batch processing.
     StreamCallFailed = 23,
+    /// Target token has not been approved for vault deposits (Issue #815).
+    TokenNotApprovedForVault = 24,
+    /// Target token has not been approved (alias for Issue #815).
+    TokenNotApproved = 25,
+    /// Vault balance changed unexpectedly within the same ledger.
+    VaultBalanceChanged = 26,
 }

@@ -262,7 +262,7 @@ impl TokenVault {
             let balance = vault_balance(&env)?;
             let default_token = get_token(&env).ok_or(Error::NotInitialized)?;
             if !is_token_approved(&env, &default_token) {
-                return Err(Error::TokenNotApproved);
+                return Err(Error::TokenNotApprovedForVault);
             }
             let max = get_max_limit(&env).ok_or(Error::NotInitialized)?;
 
@@ -353,7 +353,7 @@ impl TokenVault {
             let balance = vault_balance(&env)?;
             let default_token = get_token(&env).ok_or(Error::NotInitialized)?;
             if !is_token_approved(&env, &default_token) {
-                return Err(Error::TokenNotApproved);
+                return Err(Error::TokenNotApprovedForVault);
             }
             let expected_balance = balance
                 .checked_add(total_deposit)
@@ -434,6 +434,7 @@ impl TokenVault {
                 let stream = DripStreamClient::new(&env, &stream_address);
                 let stream_recipient = stream
                     .try_recipient()
+                    .map_err(|_| Error::StreamCallFailed)?
                     .map_err(|_| Error::StreamCallFailed)?;
                 if stream_recipient != recipient {
                     return Err(Error::NotAuthorized);
@@ -821,7 +822,7 @@ impl TokenVault {
             }
 
             if !is_token_approved(&env, &token) {
-                return Err(Error::TokenNotApproved);
+                return Err(Error::TokenNotApprovedForVault);
             }
             let before = token::Client::new(&env, &token).balance(&env.current_contract_address());
             if !check_vault_balance(&env, &token, before) {
@@ -1025,7 +1026,7 @@ impl TokenVault {
             }
             let token = get_token(&env).ok_or(Error::NotInitialized)?;
             if !is_token_approved(&env, &token) {
-                return Err(Error::TokenNotApproved);
+                return Err(Error::TokenNotApprovedForVault);
             }
             let tk = token::Client::new(&env, &token);
             let before = tk.balance(&env.current_contract_address());

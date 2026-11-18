@@ -11,6 +11,8 @@ use soroban_sdk::{
     Symbol, Vec,
 };
 
+pub use ttl::MaintenanceReserve;
+
 /// Maximum number of transfers permitted in a single batch (Issue #677).
 ///
 /// Bounded to 30 to prevent transaction CPU instruction budget limits in Soroban host.
@@ -54,6 +56,8 @@ pub enum DataKey {
     Admin,
     /// Temporary lock during batch execution to prevent reentrancy loops.
     ReentrancyLock,
+    /// Maintenance reserve for keeper gas rebate (Issue #817).
+    MaintenanceReserve,
 }
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -620,6 +624,83 @@ impl BatchTransferProcessor {
     /// See `VERSION` for the current value and its history.
     pub fn version(_env: Env) -> u32 {
         VERSION
+    }
+
+    // ── Batch Cancel & Keeper Maintenance Reserve ─────────────────────────
+
+    /// Gas-optimized batch cancellation for multiple streams belonging to a sender (Issue #816).
+    ///
+    /// Iterates through streams and invokes `cancel` on each in a single atomic transaction.
+    /// Reclaims remaining deposit balances back to the authorized sender/caller.
+    pub fn batch_cancel(
+        env: Env,
+        caller: Address,
+        stream_ids: Vec<Address>,
+    ) -> Result<u32, Error> {
+        if stream_ids.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+        if stream_ids.is_empty() {
+            return Ok(0);
+        }
+
+        caller.require_auth();
+        ttl::bump(&env);
+
+        let mut cancelled_count: u32 = 0;
+        for stream_id in stream_ids.iter() {
+            let mut args = Vec::new(&env);
+            args.push_back(caller.to_val());
+            let _: () = env.invoke_contract(&stream_id, &Symbol::new(&env, "cancel"), args);
+            cancelled_count = cancelled_count.saturating_add(1);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "batch_cancelled"), caller),
+            stream_ids.len(),
+        );
+
+        Ok(cancelled_count)
+    }
+
+    /// Admin-gated configuration for batch processor keeper maintenance rebate (Issue #817).
+    pub fn configure_maintenance_reserve(
+        env: Env,
+        caller: Address,
+        token: Address,
+        rebate_amount: i128,
+    ) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        if caller != admin {
+            return Err(Error::NotAuthorized);
+        }
+        caller.require_auth();
+        ttl::configure_maintenance_reserve(&env, &token, rebate_amount)?;
+        Ok(())
+    }
+
+    /// Fund the batch processor maintenance reserve pool (Issue #817).
+    pub fn fund_maintenance_reserve(
+        env: Env,
+        funder: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        ttl::fund_maintenance_reserve(&env, &funder, amount)?;
+        Ok(())
+    }
+
+    /// Extend batch processor storage TTL and reimburse keeper rebate if reserve is funded (Issue #817).
+    pub fn bump_ttl_with_rebate(env: Env, keeper: Address) -> Result<i128, Error> {
+        ttl::bump_with_keeper_rebate(&env, &keeper)
+    }
+
+    /// Read-only: get current maintenance reserve details (Issue #817).
+    pub fn maintenance_reserve(env: Env) -> Option<MaintenanceReserve> {
+        ttl::get_maintenance_reserve(&env)
     }
 
     // ── Self-upgrade (admin-gated) ──────────────────────────────────────────

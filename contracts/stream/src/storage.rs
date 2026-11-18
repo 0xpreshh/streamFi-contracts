@@ -80,6 +80,10 @@ pub enum DataKey {
     ReferenceTag,
     /// Optional human-readable description set at creation (#845).
     StreamDescription,
+    /// Optional metadata URI for stream invoices (Issue #748).
+    InvoiceMetadataUri,
+    /// Optional metadata URI for stream milestones (Issue #748).
+    MilestoneMetadataUri,
     /// Separately funded token pool used to reimburse stream keepers (#840).
     KeeperRewardPool,
     /// Last ledger on which a keeper reward was paid.
@@ -88,6 +92,10 @@ pub enum DataKey {
     AutoForwardAddress,
     /// Total amount funded into the stream across its lifetime (#837).
     CumulativeDeposited,
+    /// Optional secondary backup recovery address in stream state (Issue #810).
+    RecoveryAddress,
+    /// Timelock timestamp after which a recovery claim may be executed (Issue #810).
+    RecoveryClaimableAt,
 }
 
 /// Immutable stream configuration stored in instance storage for cheaper reads (Issue #702).

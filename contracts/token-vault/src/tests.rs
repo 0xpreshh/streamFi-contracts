@@ -1552,7 +1552,7 @@ fn approved_tokens_only_and_revocation_preserves_withdrawal() {
     token::StellarAssetClient::new(&s.env, &other_token).mint(&s.owner, &1000);
     assert_eq!(
         s.client.try_deposit_token(&s.owner, &other_token, &10),
-        Err(Ok(Error::TokenNotApproved))
+        Err(Ok(Error::TokenNotApprovedForVault))
     );
     s.client.approve_token(&s.owner, &other_token, &true);
     s.client.deposit_token(&s.owner, &other_token, &100);
@@ -1560,7 +1560,7 @@ fn approved_tokens_only_and_revocation_preserves_withdrawal() {
     s.client.approve_token(&s.owner, &other_token, &false);
     assert_eq!(
         s.client.try_deposit_token(&s.owner, &other_token, &10),
-        Err(Ok(Error::TokenNotApproved))
+        Err(Ok(Error::TokenNotApprovedForVault))
     );
     s.client
         .withdraw_token(&s.owner, &other_token, &s.user, &25);
@@ -1605,7 +1605,7 @@ fn default_asset_revocation_stops_deposits_not_withdrawals() {
     s.client.approve_token(&s.owner, &s.token.address, &false);
     assert_eq!(
         s.client.try_deposit(&s.owner, &10),
-        Err(Ok(Error::TokenNotApproved))
+        Err(Ok(Error::TokenNotApprovedForVault))
     );
     s.client.withdraw(&s.owner, &s.user, &25);
     assert_eq!(s.token.balance(&s.client.address), 75);

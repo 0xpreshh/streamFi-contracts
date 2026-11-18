@@ -53,4 +53,6 @@ pub enum Error {
     TokenNotApproved = 25,
     /// Vault balance changed unexpectedly within the same ledger.
     VaultBalanceChanged = 26,
+    /// Vault does not hold sufficient token liquidity for withdrawal (Issue #760).
+    InsufficientVaultLiquidity = 27,
 }

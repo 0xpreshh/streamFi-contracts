@@ -9,7 +9,7 @@ use soroban_sdk::{
 };
 
 use crate::errors::Error;
-use crate::storage;
+use crate::{events, storage, ttl};
 use crate::{DepositSpec, TokenVaultClient};
 
 struct Setup {
@@ -1609,4 +1609,117 @@ fn default_asset_revocation_stops_deposits_not_withdrawals() {
     );
     s.client.withdraw(&s.owner, &s.user, &25);
     assert_eq!(s.token.balance(&s.client.address), 75);
+}
+
+// ── Issue #757: DepositorTokens mapping & faster balance lookup ──────────────
+
+#[test]
+fn test_depositor_token_balance_tracking() {
+    let s = Setup::new(1_000_000);
+    assert_eq!(
+        s.client.get_depositor_token_balance(&s.owner, &s.token.address),
+        0
+    );
+
+    // Deposit updates depositor token balance
+    s.client.deposit(&s.owner, &500);
+    assert_eq!(
+        s.client.get_depositor_token_balance(&s.owner, &s.token.address),
+        500
+    );
+
+    // Further deposit accumulates
+    s.client.deposit(&s.owner, &250);
+    assert_eq!(
+        s.client.get_depositor_token_balance(&s.owner, &s.token.address),
+        750
+    );
+
+    // Direct storage helper check
+    s.env.as_contract(&s.client.address, || {
+        let bal = storage::get_depositor_token_balance(&s.env, &s.owner, &s.token.address);
+        assert_eq!(bal, 750);
+    });
+
+    // Withdrawal decreases depositor balance
+    let recipient = Address::generate(&s.env);
+    s.client.withdraw(&s.owner, &recipient, &300);
+    assert_eq!(
+        s.client.get_depositor_token_balance(&s.owner, &s.token.address),
+        450
+    );
+}
+
+// ── Issue #758: VaultWithdrawal event with previous and new balances ─────────
+
+#[test]
+fn test_vault_withdrawal_event_includes_previous_and_new_balance() {
+    let s = Setup::new(1_000_000);
+    s.client.deposit(&s.owner, &1_000);
+
+    let recipient = Address::generate(&s.env);
+    s.client
+        .withdraw_token(&s.owner, &s.token.address, &recipient, &400);
+
+    let events = s.env.events().all();
+    let (_, topics, data) = events.last().unwrap();
+    assert_eq!(
+        topics.clone(),
+        (
+            Symbol::new(&s.env, "VaultWithdrawal"),
+            s.owner.clone(),
+            recipient.clone()
+        )
+            .into_val(&s.env)
+    );
+
+    let payload: events::VaultWithdrawal = data.clone().try_into_val(&s.env).unwrap();
+    assert_eq!(
+        payload,
+        events::VaultWithdrawal {
+            recipient: recipient.clone(),
+            amount: 400,
+            previous_balance: 1_000,
+            new_balance: 600,
+        }
+    );
+}
+
+// ── Issue #759: Persistent storage TTL extension on balance updates ─────────
+
+#[test]
+fn test_extend_balance_ttl_does_not_panic() {
+    let s = Setup::new(1_000_000);
+    s.client.deposit(&s.owner, &200);
+
+    // Call extension helper
+    s.client.extend_balance_ttl(&s.token.address, &s.owner);
+
+    s.env.as_contract(&s.client.address, || {
+        ttl::extend_balance_ttl(&s.env, &s.token.address, &s.owner);
+    });
+}
+
+// ── Issue #760: InsufficientVaultLiquidity error variant on excess withdrawal ─
+
+#[test]
+fn test_insufficient_vault_liquidity_rejection() {
+    let s = Setup::new(1_000_000);
+    s.client.deposit(&s.owner, &500);
+
+    let recipient = Address::generate(&s.env);
+
+    // Attempting to withdraw more than the vault has in liquidity returns InsufficientVaultLiquidity
+    let res = s.client.try_withdraw(&s.owner, &recipient, &600);
+    assert_eq!(res, Err(Ok(Error::InsufficientVaultLiquidity)));
+
+    // withdraw_token also returns InsufficientVaultLiquidity
+    let res_tok = s
+        .client
+        .try_withdraw_token(&s.owner, &s.token.address, &recipient, &600);
+    assert_eq!(res_tok, Err(Ok(Error::InsufficientVaultLiquidity)));
+
+    // Withdrawing within available liquidity succeeds
+    let ok_res = s.client.try_withdraw(&s.owner, &recipient, &500);
+    assert!(ok_res.is_ok());
 }

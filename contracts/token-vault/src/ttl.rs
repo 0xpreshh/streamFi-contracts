@@ -19,3 +19,20 @@ pub fn bump_all_vault_keys(env: &soroban_sdk::Env) -> u32 {
     }
     refreshed
 }
+
+/// Extend persistent storage TTL for token vault balance entries on balance updates (Issue #759).
+pub fn extend_balance_ttl(
+    env: &soroban_sdk::Env,
+    token: &soroban_sdk::Address,
+    account: &soroban_sdk::Address,
+) {
+    let acc_key = crate::storage::DataKey::TokenAccountBalance(token.clone(), account.clone());
+    if env.storage().persistent().has(&acc_key) {
+        drip_common::ttl::bump_persistent(env, &acc_key);
+    }
+
+    let dep_key = crate::storage::DataKey::DepositorTokens(account.clone(), token.clone());
+    if env.storage().persistent().has(&dep_key) {
+        drip_common::ttl::bump_persistent(env, &dep_key);
+    }
+}

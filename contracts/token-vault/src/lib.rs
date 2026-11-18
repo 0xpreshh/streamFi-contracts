@@ -15,14 +15,14 @@ use storage::{
     check_vault_balance, get_depositor_token_balance, get_emergency_migration, get_max_limit,
     get_operator, get_operator_withdraw_limit, get_owner, get_owner_proposal_ttl,
     get_pending_owner, get_pending_owner_proposed_at, get_pending_owner_proposer, get_token,
-    get_token_account_balance, get_token_max_limit, is_paused, is_token_approved,
-    record_vault_balance, remove_emergency_migration, remove_operator, remove_pending_owner,
-    remove_pending_owner_proposed_at, remove_pending_owner_proposer, set_depositor_token_balance,
-    set_emergency_migration, set_max_limit, set_operator, set_operator_withdraw_limit, set_owner,
-    set_owner_proposal_ttl as store_owner_proposal_ttl, set_paused, set_pending_owner,
-    set_pending_owner_proposed_at, set_pending_owner_proposer, set_token,
-    set_token_account_balance, set_token_approved, set_token_max_limit, DataKey,
-    EmergencyMigration,
+    get_token_account_balance, get_token_max_limit, get_token_min_deposit, is_paused,
+    is_token_approved, record_vault_balance, remove_emergency_migration, remove_operator,
+    remove_pending_owner, remove_pending_owner_proposed_at, remove_pending_owner_proposer,
+    set_depositor_token_balance, set_emergency_migration, set_max_limit, set_operator,
+    set_operator_withdraw_limit, set_owner, set_owner_proposal_ttl as store_owner_proposal_ttl,
+    set_paused, set_pending_owner, set_pending_owner_proposed_at, set_pending_owner_proposer,
+    set_token, set_token_account_balance, set_token_approved, set_token_max_limit,
+    set_token_min_deposit, DataKey, EmergencyMigration,
 };
 use ttl::bump_instance;
 
@@ -276,6 +276,10 @@ impl TokenVault {
             if !is_token_approved(&env, &default_token) {
                 return Err(Error::TokenNotApprovedForVault);
             }
+            let min_deposit = get_token_min_deposit(&env, &default_token);
+            if min_deposit > 0 && amount < min_deposit {
+                return Err(Error::DepositBelowMin);
+            }
             let max = get_max_limit(&env).ok_or(Error::NotInitialized)?;
 
             let expected_balance = balance
@@ -352,6 +356,8 @@ impl TokenVault {
             }
             let _owner = get_owner(&env).ok_or(Error::NotInitialized)?;
             let max = get_max_limit(&env).ok_or(Error::NotInitialized)?;
+            let default_token = get_token(&env).ok_or(Error::NotInitialized)?;
+            let min_deposit = get_token_min_deposit(&env, &default_token);
 
             let mut total_deposit: i128 = 0;
             for deposit in deposits.iter() {
@@ -360,6 +366,9 @@ impl TokenVault {
                 }
                 if deposit.amount > MAX_VAULT_DEPOSIT {
                     return Err(Error::DepositExceedsMax);
+                }
+                if min_deposit > 0 && deposit.amount < min_deposit {
+                    return Err(Error::DepositBelowMin);
                 }
                 deposit.from.require_auth();
                 total_deposit = total_deposit
@@ -851,6 +860,10 @@ impl TokenVault {
             if !is_token_approved(&env, &token) {
                 return Err(Error::TokenNotApprovedForVault);
             }
+            let min_deposit = get_token_min_deposit(&env, &token);
+            if min_deposit > 0 && amount < min_deposit {
+                return Err(Error::DepositBelowMin);
+            }
             let before = token::Client::new(&env, &token).balance(&env.current_contract_address());
             if !check_vault_balance(&env, &token, before) {
                 return Err(Error::VaultBalanceChanged);
@@ -1010,6 +1023,51 @@ impl TokenVault {
         get_token_max_limit(&env, &token)
     }
 
+    /// Sets the minimum deposit amount threshold for an asset (Issue #756).
+    pub fn set_min_deposit_amount(
+        env: Env,
+        caller: Address,
+        token: Address,
+        min_amount: i128,
+    ) -> Result<(), Error> {
+        assert_not_paused(&env)?;
+        let owner = get_owner(&env).ok_or(Error::NotInitialized)?;
+        require_owner_or_operator(&env, &caller, &owner)?;
+
+        if min_amount < 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        set_token_min_deposit(&env, &token, min_amount);
+        bump_instance(&env);
+        Ok(())
+    }
+
+    /// Alias for `set_min_deposit_amount` (Issue #756).
+    pub fn set_token_min_deposit(
+        env: Env,
+        caller: Address,
+        token: Address,
+        min_amount: i128,
+    ) -> Result<(), Error> {
+        Self::set_min_deposit_amount(env, caller, token, min_amount)
+    }
+
+    /// Read-only: minimum deposit amount threshold for an asset (Issue #756).
+    pub fn min_deposit_amount(env: Env, token: Address) -> i128 {
+        get_token_min_deposit(&env, &token)
+    }
+
+    /// Read-only alias for `min_deposit_amount` (Issue #756).
+    pub fn get_min_deposit_amount(env: Env, token: Address) -> i128 {
+        get_token_min_deposit(&env, &token)
+    }
+
+    /// Read-only alias for `min_deposit_amount` (Issue #756).
+    pub fn get_token_min_deposit(env: Env, token: Address) -> i128 {
+        get_token_min_deposit(&env, &token)
+    }
+
     /// Read-only: pre-flight check validating that target token adheres to standard SEP-0041 interface (Issue #696).
     pub fn is_token_compliant(env: Env, token: Address) -> bool {
         validate_sep41_token(&env, &token).is_ok()
@@ -1078,6 +1136,10 @@ impl TokenVault {
             let token = get_token(&env).ok_or(Error::NotInitialized)?;
             if !is_token_approved(&env, &token) {
                 return Err(Error::TokenNotApprovedForVault);
+            }
+            let min_deposit = get_token_min_deposit(&env, &token);
+            if min_deposit > 0 && amount < min_deposit {
+                return Err(Error::DepositBelowMin);
             }
             let tk = token::Client::new(&env, &token);
             let before = tk.balance(&env.current_contract_address());

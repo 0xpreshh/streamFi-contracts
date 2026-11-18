@@ -1723,3 +1723,57 @@ fn test_insufficient_vault_liquidity_rejection() {
     let ok_res = s.client.try_withdraw(&s.owner, &recipient, &500);
     assert!(ok_res.is_ok());
 }
+
+// ── Issue #756: Enforce minimum deposit amount threshold per asset ──────────
+
+#[test]
+fn test_min_deposit_amount_threshold_enforcement() {
+    let s = Setup::new(1_000_000);
+
+    // Initial min deposit amount is 0
+    assert_eq!(s.client.get_min_deposit_amount(&s.token.address), 0);
+    assert_eq!(s.client.min_deposit_amount(&s.token.address), 0);
+
+    // Non-owner cannot configure min deposit amount
+    let stranger = Address::generate(&s.env);
+    assert_eq!(
+        s.client.try_set_min_deposit_amount(&stranger, &s.token.address, &100),
+        Err(Ok(Error::NotAuthorized))
+    );
+
+    // Negative min deposit amount is rejected
+    assert_eq!(
+        s.client.try_set_min_deposit_amount(&s.owner, &s.token.address, &-5),
+        Err(Ok(Error::InvalidAmount))
+    );
+
+    // Owner configures min deposit to 100
+    let res = s.client.try_set_min_deposit_amount(&s.owner, &s.token.address, &100);
+    assert!(res.is_ok());
+    assert_eq!(s.client.get_min_deposit_amount(&s.token.address), 100);
+    assert_eq!(s.client.min_deposit_amount(&s.token.address), 100);
+
+    // Deposit below min (e.g. 50) is rejected with DepositBelowMin
+    let res_below = s.client.try_deposit(&s.owner, &50);
+    assert_eq!(res_below, Err(Ok(Error::DepositBelowMin)));
+
+    // deposit_token below min is also rejected
+    let res_tok_below = s.client.try_deposit_token(&s.owner, &s.token.address, &50);
+    assert_eq!(res_tok_below, Err(Ok(Error::DepositBelowMin)));
+
+    // Deposit at or above min (e.g. 100) succeeds
+    let res_ok = s.client.try_deposit(&s.owner, &100);
+    assert!(res_ok.is_ok());
+
+    // batch_deposit with an entry below min is also rejected
+    let deposits = soroban_sdk::vec![
+        &s.env,
+        crate::DepositSpec {
+            from: s.owner.clone(),
+            amount: 50,
+        }
+    ];
+    let res_batch_below = s.client.try_batch_deposit(&deposits);
+    assert_eq!(res_batch_below, Err(Ok(Error::DepositBelowMin)));
+}
+

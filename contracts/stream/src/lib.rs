@@ -15,7 +15,8 @@ use drip_common::{is_zero_address, pause};
 
 pub use errors::Error;
 pub use storage::{
-    CliffConfig, SplitConfig, StreamConfig, StreamKeeperRewardPool, StreamStatus, StreamSummary,
+    CancelledStreamRecord, CliffConfig, SplitConfig, StreamConfig, StreamKeeperRewardPool,
+    StreamStatus, StreamSummary,
 };
 use storage::{
     DataKey, RateCheckpoint, StreamInfo, FLAG_CLAWBACK_ENABLED, FLAG_PAUSED, FLAG_REGULATED_ASSET,
@@ -448,10 +449,19 @@ impl DripStream {
     /// the recipient's share MUST be transferred here rather than left for
     /// a later `withdraw()` call.
     pub fn cancel(env: Env, caller: Address) -> Result<(), Error> {
-        state::with_guard(&env, |env| Self::_cancel(env, &caller))
+        Self::cancel_with_reason(env, caller, 0)
     }
 
-    fn _cancel(env: &Env, caller: &Address) -> Result<(), Error> {
+    /// Sender or delegated operator cancels the stream with an explicit reason code (Issue #755).
+    pub fn cancel_with_reason(
+        env: Env,
+        caller: Address,
+        cancellation_reason: u32,
+    ) -> Result<(), Error> {
+        state::with_guard(&env, |env| Self::_cancel(env, &caller, cancellation_reason))
+    }
+
+    fn _cancel(env: &Env, caller: &Address, cancellation_reason: u32) -> Result<(), Error> {
         ttl::bump(env);
 
         let info = state::load(env);
@@ -526,6 +536,14 @@ impl DripStream {
             tk.transfer(&contract_addr, &info.sender, &refund_to_sender);
         }
 
+        let record = CancelledStreamRecord {
+            cancellation_reason,
+            cancelled_at: env.ledger().timestamp(),
+            cancelled_by: caller.clone(),
+            refund_amount: refund_to_sender,
+        };
+        storage::set_cancelled_record(env, &record);
+
         events::cancelled(
             env,
             &info.sender,
@@ -534,6 +552,11 @@ impl DripStream {
             refund_to_sender,
         );
         Ok(())
+    }
+
+    /// Read the persistent cancellation record if the stream was cancelled (Issue #755).
+    pub fn cancellation_record(env: Env) -> Option<CancelledStreamRecord> {
+        storage::get_cancelled_record(&env)
     }
 
     /// Sender or delegated operator pauses the stream.
@@ -600,6 +623,43 @@ impl DripStream {
         state::save(env, &updated);
 
         events::paused(env, caller, now, w);
+        Ok(())
+    }
+
+    /// Recipient-initiated pause with rate dampening (Issue #754).
+    pub fn pause_by_recipient(env: Env, caller: Address) -> Result<(), Error> {
+        state::with_guard(&env, |env| Self::_pause_by_recipient(env, &caller))
+    }
+
+    fn _pause_by_recipient(env: &Env, caller: &Address) -> Result<(), Error> {
+        ttl::bump(env);
+
+        let info = state::load(env);
+        state::assert_not_cancelled(&info)?;
+        if info.is_paused() {
+            return Err(Error::AlreadyPaused);
+        }
+        if caller != &info.recipient {
+            return Err(Error::NotAuthorized);
+        }
+        caller.require_auth();
+
+        let now = env.ledger().timestamp();
+        if now < info.start_time {
+            return Err(Error::StreamNotStarted);
+        }
+        // Reject pausing a stream that has already ended.
+        if info.end_time > 0 && now > info.end_time {
+            return Err(Error::StreamEnded);
+        }
+        let w = math::withdrawable(env, &info)?;
+
+        let mut updated = info.clone();
+        updated.flags |= FLAG_PAUSED;
+        updated.paused_at = now;
+        state::save(env, &updated);
+
+        events::stream_paused_by_recipient(env, &info.recipient, now, w);
         Ok(())
     }
 
@@ -1423,6 +1483,14 @@ impl DripStream {
             tk.transfer(&contract_addr, &info.sender, &refund_to_sender);
         }
 
+        let record = CancelledStreamRecord {
+            cancellation_reason: 0,
+            cancelled_at: now,
+            cancelled_by: info.recipient.clone(),
+            refund_amount: refund_to_sender,
+        };
+        storage::set_cancelled_record(env, &record);
+
         events::force_cancelled(
             env,
             &info.sender,
@@ -2059,6 +2127,12 @@ impl DripStream {
     /// Read-only alias for `get_summary`.
     pub fn get_stream_summary(env: Env) -> StreamSummary {
         Self::get_summary(env)
+    }
+
+    /// Read-only: check whether the stream remaining balance is depleted (Issue #753).
+    pub fn is_depleted(env: Env) -> bool {
+        let info = state::load(&env);
+        info.is_depleted()
     }
 
     /// Set a cliff unlock configuration for this stream (Issue #719).

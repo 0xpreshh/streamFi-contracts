@@ -55,4 +55,6 @@ pub enum Error {
     VaultBalanceChanged = 26,
     /// Vault does not hold sufficient token liquidity for withdrawal (Issue #760).
     InsufficientVaultLiquidity = 27,
+    /// Deposit amount is below the configured minimum deposit amount for this asset (Issue #756).
+    DepositBelowMin = 28,
 }

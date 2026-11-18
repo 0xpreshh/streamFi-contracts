@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, String};
+use soroban_sdk::{contracttype, Address, Env, String};
 
 // Bit-flags packed into `StreamInfo::flags`. Kept `pub` so cross-crate
 // regression tests (e.g. `tests/audit_round_2_regression.rs::pause_resume_*`)
@@ -98,6 +98,8 @@ pub enum DataKey {
     RecoveryClaimableAt,
     /// Optional flag allowing keepers or senders to auto-settle the stream upon stream end (Issue #809).
     AutoSettle,
+    /// Persistent storage record of stream cancellation reason and metadata (Issue #755).
+    CancelledRecord,
 }
 
 /// Immutable stream configuration stored in instance storage for cheaper reads (Issue #702).
@@ -228,6 +230,19 @@ impl StreamInfo {
         self.flags |= FLAG_REGULATED_ASSET;
     }
 
+    /// True when all deposited stream funds have been completely withdrawn or stream is ended and fully drained (Issue #753).
+    pub fn is_depleted(&self) -> bool {
+        if self.is_cancelled() {
+            true
+        } else if self.end_time > 0 && self.rate_per_second > 0 {
+            let duration = self.end_time.saturating_sub(self.start_time) as i128;
+            let total = self.rate_per_second.saturating_mul(duration);
+            self.withdrawn >= total
+        } else {
+            false
+        }
+    }
+
     /// Calculate stream age in seconds from start_time up to current_time (Issue #808).
     pub fn elapsed_seconds(&self, current_time: u64) -> u64 {
         if current_time <= self.start_time {
@@ -244,3 +259,23 @@ impl StreamInfo {
 
 /// Alias for `StreamInfo` representing persisted stream state (Issue #808).
 pub type StreamState = StreamInfo;
+
+/// Record of stream cancellation stored in persistent storage (Issue #755).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancelledStreamRecord {
+    pub cancellation_reason: u32,
+    pub cancelled_at: u64,
+    pub cancelled_by: Address,
+    pub refund_amount: i128,
+}
+
+pub fn set_cancelled_record(env: &Env, record: &CancelledStreamRecord) {
+    let key = DataKey::CancelledRecord;
+    env.storage().persistent().set(&key, record);
+    drip_common::ttl::bump_persistent(env, &key);
+}
+
+pub fn get_cancelled_record(env: &Env) -> Option<CancelledStreamRecord> {
+    env.storage().persistent().get(&DataKey::CancelledRecord)
+}

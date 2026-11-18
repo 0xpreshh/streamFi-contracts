@@ -11,6 +11,12 @@ pub fn elapsed_seconds(info: &StreamInfo, current_time: u64) -> u64 {
     info.elapsed_seconds(current_time)
 }
 
+/// Helper method to check if a stream's remaining balance is depleted (Issue #753).
+#[allow(dead_code)]
+pub fn is_depleted(state: &StreamState) -> bool {
+    state.is_depleted()
+}
+
 /// Load the full stream state in a single storage read.
 ///
 /// Reads the consolidated `Config` key. All streams are now written with

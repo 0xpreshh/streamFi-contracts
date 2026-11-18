@@ -109,6 +109,7 @@ pub fn streamed_amount(env: &Env, info: &StreamInfo) -> Result<i128, Error> {
 
 /// Calculates linear streamed amount: `rate_per_second * elapsed`, returning `Error::ArithmeticOverflow` on overflow (Issue #681).
 /// Optimized to prevent precision loss by checking for zero cases first (Issue #784).
+#[allow(dead_code)]
 pub fn calculate_streamed_amount(rate_per_second: i128, elapsed: u64) -> Result<i128, Error> {
     if rate_per_second == 0 || elapsed == 0 {
         return Ok(0);
@@ -120,11 +121,64 @@ pub fn calculate_streamed_amount(rate_per_second: i128, elapsed: u64) -> Result<
 
 /// Safely calculates rate × duration with saturating arithmetic to prevent overflow (Issue #749).
 /// Saturates at i128::MAX if the result exceeds the maximum value.
+#[allow(dead_code)]
 pub fn rate_duration_saturating(rate_per_second: i128, duration: u64) -> i128 {
     if rate_per_second == 0 || duration == 0 {
         return 0;
     }
     rate_per_second.saturating_mul(duration as i128)
+}
+
+/// Calculates exponential decay streamed amount based on half-life (Issue #804).
+///
+/// Formula: tokens unlock following an exponential decay schedule where half the remaining
+/// unstreamed amount unlocks every `half_life` seconds.
+/// - At `elapsed == 0`: returns 0
+/// - At `elapsed == half_life`: returns `initial_amount / 2`
+/// - At `elapsed == 2 * half_life`: returns `initial_amount * 3 / 4`
+/// - As `elapsed -> inf`: approaches `initial_amount`
+#[allow(dead_code)]
+pub fn calculate_decay_stream(
+    initial_amount: i128,
+    elapsed: u64,
+    half_life: u64,
+) -> Result<i128, Error> {
+    if half_life == 0 {
+        return Err(Error::InvalidTimeRange);
+    }
+    if initial_amount < 0 {
+        return Err(Error::InvalidAmount);
+    }
+    if initial_amount == 0 || elapsed == 0 {
+        return Ok(0);
+    }
+
+    let halvings = elapsed / half_life;
+    if halvings >= 127 {
+        return Ok(initial_amount);
+    }
+
+    let base_remaining = initial_amount >> halvings;
+    let rem = elapsed % half_life;
+
+    let decay_in_interval = if rem == 0 {
+        0
+    } else {
+        let divisor = 2 * (half_life as i128);
+        match base_remaining.checked_mul(rem as i128) {
+            Some(prod) => prod / divisor,
+            None => {
+                let q = base_remaining / divisor;
+                let r = base_remaining % divisor;
+                q.saturating_mul(rem as i128)
+                    .saturating_add((r.saturating_mul(rem as i128)) / divisor)
+            }
+        }
+    };
+
+    let remaining = base_remaining.saturating_sub(decay_in_interval);
+    let streamed = initial_amount.saturating_sub(remaining);
+    Ok(streamed.min(initial_amount))
 }
 
 /// Returns tokens available for the recipient to withdraw right now.
@@ -249,7 +303,7 @@ mod tests {
         // Overflow saturates to i128::MAX instead of panicking
         assert_eq!(rate_duration_saturating(i128::MAX, 2), i128::MAX);
         assert_eq!(rate_duration_saturating(i128::MAX, u64::MAX), i128::MAX);
-        assert_eq!(rate_duration_saturating(1_000_000_000_000, u64::MAX), i128::MAX);
+        assert_eq!(rate_duration_saturating(1i128 << 70, u64::MAX), i128::MAX);
     }
 
     #[test]
@@ -262,5 +316,79 @@ mod tests {
         assert_eq!(rate_duration_saturating(half_max, 2), half_max.saturating_mul(2));
         // With 3, it would overflow to max
         assert_eq!(rate_duration_saturating(half_max, 3), i128::MAX);
+    }
+
+    #[test]
+    fn test_calculate_decay_stream_validations() {
+        // Zero half_life returns InvalidTimeRange
+        assert_eq!(
+            calculate_decay_stream(1000, 10, 0),
+            Err(Error::InvalidTimeRange)
+        );
+
+        // Negative initial amount returns InvalidAmount
+        assert_eq!(
+            calculate_decay_stream(-100, 10, 60),
+            Err(Error::InvalidAmount)
+        );
+
+        // Zero initial amount or zero elapsed returns 0
+        assert_eq!(calculate_decay_stream(0, 100, 60).unwrap(), 0);
+        assert_eq!(calculate_decay_stream(1000, 0, 60).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_calculate_decay_stream_half_lives() {
+        let initial = 1_000_000;
+        let half_life = 3600;
+
+        // At 0 seconds: 0 streamed
+        assert_eq!(calculate_decay_stream(initial, 0, half_life).unwrap(), 0);
+
+        // At 1 half-life (3600s): exactly 50% streamed
+        assert_eq!(
+            calculate_decay_stream(initial, half_life, half_life).unwrap(),
+            500_000
+        );
+
+        // At 2 half-lives (7200s): 75% streamed
+        assert_eq!(
+            calculate_decay_stream(initial, half_life * 2, half_life).unwrap(),
+            750_000
+        );
+
+        // At 3 half-lives: 87.5% streamed
+        assert_eq!(
+            calculate_decay_stream(initial, half_life * 3, half_life).unwrap(),
+            875_000
+        );
+    }
+
+    #[test]
+    fn test_calculate_decay_stream_monotonic_interpolation() {
+        let initial = 10_000;
+        let half_life = 100;
+
+        let mut prev = 0;
+        for t in 0..=300 {
+            let streamed = calculate_decay_stream(initial, t, half_life).unwrap();
+            assert!(streamed >= prev, "streamed amount must be monotonic");
+            assert!(streamed <= initial, "streamed cannot exceed initial amount");
+            prev = streamed;
+        }
+    }
+
+    #[test]
+    fn test_calculate_decay_stream_extreme_elapsed_and_amounts() {
+        let initial = 1_000_000_000_000_000_000_i128;
+        let half_life = 100;
+
+        // Long elapsed time saturates to initial amount
+        let streamed = calculate_decay_stream(initial, 100 * 200, half_life).unwrap();
+        assert_eq!(streamed, initial);
+
+        // u64::MAX elapsed time saturates without overflow or panic
+        let max_streamed = calculate_decay_stream(initial, u64::MAX, half_life).unwrap();
+        assert_eq!(max_streamed, initial);
     }
 }

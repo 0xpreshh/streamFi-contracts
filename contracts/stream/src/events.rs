@@ -375,6 +375,18 @@ pub fn cliff_reached(env: &Env, recipient: &Address, timestamp: u64, unlock_amou
     );
 }
 
+/// Emitted upon the first withdrawal after cliff timestamp (Issue #752).
+///
+/// Topics: `("StreamCliffReached", recipient)`
+/// Data:   `(timestamp, unlock_amount)`
+pub fn stream_cliff_reached(env: &Env, recipient: &Address, timestamp: u64, unlock_amount: i128) {
+    assert_non_negative_amount(env, unlock_amount);
+    env.events().publish(
+        (Symbol::new(env, "StreamCliffReached"), recipient.clone()),
+        (timestamp, unlock_amount),
+    );
+}
+
 /// Publish a milestone event when a stream naturally runs to completion and is fully settled to zero remaining balance (Issue #676).
 pub fn stream_completed(env: &Env, recipient: &Address, total_withdrawn: i128) {
     assert_non_negative_amount(env, total_withdrawn);

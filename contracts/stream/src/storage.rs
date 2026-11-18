@@ -68,6 +68,8 @@ pub enum DataKey {
     ImmutableConfig,
     /// Milestone flag indicating the cliff timestamp was passed and event emitted (Issue #676).
     CliffReached,
+    /// Track whether cliff amount has been claimed on first withdrawal after cliff (Issue #752).
+    CliffClaimed,
     /// Milestone flag indicating the stream has fully settled and completion event emitted (Issue #676).
     StreamCompleted,
     /// Stream cancellation configuration (Issue #685).

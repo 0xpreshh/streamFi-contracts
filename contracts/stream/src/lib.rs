@@ -312,6 +312,7 @@ impl DripStream {
             return Err(Error::InvalidAmount);
         }
         ttl::bump(env);
+        ttl::extend_on_activity(env);
 
         let info = state::load(env);
         state::assert_not_cancelled(&info)?;
@@ -347,6 +348,9 @@ impl DripStream {
         // genuinely nothing to send.
         let available = math::withdrawable(env, &info)?;
         if available == 0 {
+            if info.end_time > 0 && env.ledger().timestamp() >= info.end_time && info.is_depleted() {
+                return Err(Error::StreamAlreadyCompleted);
+            }
             return Err(Error::NothingToWithdraw);
         }
 
@@ -415,12 +419,17 @@ impl DripStream {
             .ok_or(Error::ArithmeticOverflow)?;
         events::withdrawn(env, &info.recipient, to_send, new_withdrawn, remaining);
 
-        // Check if cliff timestamp was reached and emit event once (Issue #676)
+        // Check if cliff timestamp was reached and emit event once (Issues #676, #752)
         let cliff_opt: Option<CliffConfig> = env.storage().instance().get(&DataKey::CliffConfig);
         if let Some(cliff) = cliff_opt {
-            if now >= cliff.cliff_time && !env.storage().instance().has(&DataKey::CliffReached) {
+            if now >= cliff.cliff_time
+                && !env.storage().instance().has(&DataKey::CliffReached)
+                && !env.storage().instance().has(&DataKey::CliffClaimed)
+            {
                 env.storage().instance().set(&DataKey::CliffReached, &true);
+                env.storage().instance().set(&DataKey::CliffClaimed, &true);
                 events::cliff_reached(env, &info.recipient, now, cliff.cliff_unlock_amount);
+                events::stream_cliff_reached(env, &info.recipient, now, cliff.cliff_unlock_amount);
             }
         }
 
@@ -851,6 +860,7 @@ impl DripStream {
         caller.require_auth();
 
         ttl::bump(env);
+        ttl::extend_on_activity(env);
         state::assert_not_cancelled(&info)?;
 
         // Reject top-ups on a bounded stream that has already ended. Depositing
@@ -867,6 +877,9 @@ impl DripStream {
         // job.
         let now = env.ledger().timestamp();
         if info.end_time > 0 && now >= info.end_time {
+            if info.is_depleted() || env.storage().instance().has(&DataKey::StreamCompleted) {
+                return Err(Error::StreamAlreadyCompleted);
+            }
             return Err(Error::StreamEnded);
         }
 
@@ -1002,6 +1015,7 @@ impl DripStream {
         require_sender_or_operator(env, caller, &info.sender)?;
 
         ttl::bump(env);
+        ttl::extend_on_activity(env);
         state::assert_not_cancelled(&info)?;
 
         if info.end_time == 0 {
@@ -1351,6 +1365,9 @@ impl DripStream {
 
         let available = math::withdrawable(&env, &info)?;
         if available == 0 {
+            if info.end_time > 0 && env.ledger().timestamp() >= info.end_time && info.is_depleted() {
+                return Err(Error::StreamAlreadyCompleted);
+            }
             return Err(Error::NothingToWithdraw);
         }
 
@@ -2133,6 +2150,17 @@ impl DripStream {
     pub fn is_depleted(env: Env) -> bool {
         let info = state::load(&env);
         info.is_depleted()
+    }
+
+    /// Read-only: check whether the cliff amount has been claimed (Issue #752).
+    pub fn is_cliff_claimed(env: Env) -> bool {
+        env.storage().instance().has(&DataKey::CliffClaimed)
+            || env.storage().instance().has(&DataKey::CliffReached)
+    }
+
+    /// Read-only alias for `is_cliff_claimed` (Issue #752).
+    pub fn cliff_claimed(env: Env) -> bool {
+        Self::is_cliff_claimed(env)
     }
 
     /// Set a cliff unlock configuration for this stream (Issue #719).

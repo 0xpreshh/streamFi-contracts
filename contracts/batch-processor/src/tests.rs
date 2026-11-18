@@ -825,3 +825,210 @@ fn keeper_maintenance_reserve_rebate() {
     assert_eq!(s.client.maintenance_reserve().unwrap().balance, 10_000);
     assert_eq!(s.token.balance(&keeper), rebate_amount);
 }
+
+// ── Issue #761: lenient batch withdraw with status reporting ───────────────
+
+#[soroban_sdk::contract]
+pub struct MockStreamContract;
+
+#[soroban_sdk::contractimpl]
+impl MockStreamContract {
+    pub fn withdraw(_env: Env, amount: i128) -> Result<i128, Error> {
+        if amount == 999 {
+            return Err(Error::NotAuthorized);
+        }
+        Ok(amount)
+    }
+
+    pub fn withdrawable(_env: Env) -> Result<i128, Error> {
+        Ok(500)
+    }
+}
+
+#[test]
+fn test_batch_withdraw_lenient_success_and_failures() {
+    let s = Setup::new();
+    let stream_success = s.env.register_contract(None, MockStreamContract);
+    let stream_fail = s.env.register_contract(None, MockStreamContract);
+
+    let mut stream_ids = Vec::new(&s.env);
+    stream_ids.push_back(stream_success.clone());
+    stream_ids.push_back(stream_fail.clone());
+
+    let mut amounts = Vec::new(&s.env);
+    amounts.push_back(100i128); // Success
+    amounts.push_back(999i128); // Triggers Error::NotAuthorized (code 6)
+
+    let results = s
+        .client
+        .batch_withdraw_lenient(&stream_ids, &amounts);
+
+    assert_eq!(results.len(), 2);
+    let r0 = results.get(0).unwrap();
+    assert_eq!(r0.0, stream_success);
+    assert_eq!(r0.1, true);
+    assert_eq!(r0.2, 0);
+
+    let r1 = results.get(1).unwrap();
+    assert_eq!(r1.0, stream_fail);
+    assert_eq!(r1.1, false);
+    assert_eq!(r1.2, Error::NotAuthorized as u32);
+}
+
+#[test]
+fn test_batch_withdraw_lenient_empty_amounts_queries_withdrawable() {
+    let s = Setup::new();
+    let stream = s.env.register_contract(None, MockStreamContract);
+
+    let mut stream_ids = Vec::new(&s.env);
+    stream_ids.push_back(stream.clone());
+
+    let empty_amounts = Vec::new(&s.env);
+    let results = s
+        .client
+        .batch_withdraw_lenient(&stream_ids, &empty_amounts);
+
+    assert_eq!(results.len(), 1);
+    let r0 = results.get(0).unwrap();
+    assert_eq!(r0.0, stream);
+    assert_eq!(r0.1, true);
+    assert_eq!(r0.2, 0);
+}
+
+#[test]
+fn test_batch_withdraw_lenient_validation_guards() {
+    let s = Setup::new();
+
+    // Empty streams succeeds with empty result
+    let empty_streams = Vec::new(&s.env);
+    let empty_amounts = Vec::new(&s.env);
+    assert_eq!(
+        s.client.batch_withdraw_lenient(&empty_streams, &empty_amounts).len(),
+        0
+    );
+
+    // Oversized streams returns BatchTooLarge
+    let mut oversized = Vec::new(&s.env);
+    for _ in 0..(MAX_BATCH_SIZE + 1) {
+        oversized.push_back(Address::generate(&s.env));
+    }
+    assert_eq!(
+        s.client.try_batch_withdraw_lenient(&oversized, &empty_amounts),
+        Err(Ok(Error::BatchTooLarge))
+    );
+
+    // Mismatched amounts returns LengthMismatch
+    let mut stream_ids = Vec::new(&s.env);
+    stream_ids.push_back(Address::generate(&s.env));
+    let mut amounts = Vec::new(&s.env);
+    amounts.push_back(100);
+    amounts.push_back(200);
+    assert_eq!(
+        s.client.try_batch_withdraw_lenient(&stream_ids, &amounts),
+        Err(Ok(Error::LengthMismatch))
+    );
+}
+
+// ── Issue #762: TTL extension helpers ───────────────────────────────────────
+
+#[test]
+fn test_bump_ttl_to_stream_expiration() {
+    let s = Setup::new();
+    let current_ledger = s.env.ledger().sequence();
+
+    // Call extension to future ledger
+    s.client.bump_ttl_to_stream_expiration(&(current_ledger + 50_000));
+
+    // Call automated helper
+    s.client.bump_instance_and_keys();
+}
+
+// ── Issue #763: fuzz testing max batch size boundaries (100 items) ──────────
+
+#[test]
+fn test_fuzz_batch_size_boundaries_gas_and_limits() {
+    let s = Setup::new();
+
+    // Fuzz and boundary sizes around 100 items: 99, 100, 101
+    let boundary_sizes = [99u32, 100u32, 101u32];
+
+    for &size in boundary_sizes.iter() {
+        let recipients = s.recipients(size);
+        let amounts = s.filled(10, size);
+
+        // 1. process_batch at boundary size must be rejected cheaply with BatchTooLarge
+        s.env.budget().reset_unlimited();
+        s.env.budget().reset_tracker();
+        let res = s.client.try_process_batch(&s.funder, &s.token_addr, &recipients, &amounts);
+        assert_eq!(res, Err(Ok(Error::BatchTooLarge)));
+        let cpu_process = s.env.budget().cpu_instruction_cost();
+        let mem_process = s.env.budget().memory_bytes_cost();
+
+        // Host gas limits: Stellar mainnet CPU limit is 100M instructions.
+        // Rejection must be cheap (less than 600,000 instructions)
+        assert!(
+            cpu_process < 600_000,
+            "boundary size {size} cpu cost {cpu_process} exceeded gas ceiling"
+        );
+        assert!(
+            mem_process < 200_000,
+            "boundary size {size} memory cost {mem_process} exceeded memory ceiling"
+        );
+
+        // 2. preview_batch at boundary size must also be rejected with BatchTooLarge
+        s.env.budget().reset_unlimited();
+        s.env.budget().reset_tracker();
+        let preview_res = s.client.try_preview_batch(&recipients, &amounts);
+        assert_eq!(preview_res, Err(Ok(Error::BatchTooLarge)));
+        let cpu_preview = s.env.budget().cpu_instruction_cost();
+        assert!(
+            cpu_preview < 600_000,
+            "preview boundary size {size} cpu cost {cpu_preview} exceeded ceiling"
+        );
+
+        // 3. batch_cancel at boundary size must be rejected with BatchTooLarge
+        let cancel_res = s.client.try_batch_cancel(&s.funder, &recipients);
+        assert_eq!(cancel_res, Err(Ok(Error::BatchTooLarge)));
+
+        // 4. batch_withdraw_lenient at boundary size must be rejected with BatchTooLarge
+        let withdraw_res = s.client.try_batch_withdraw_lenient(&recipients, &amounts);
+        assert_eq!(withdraw_res, Err(Ok(Error::BatchTooLarge)));
+
+        // 5. process_batch_with_limit with 99, 100, 101 items and max_items=30 processes 30 and leaves remainder
+        let partial_res = s
+            .client
+            .process_batch_with_limit(&s.funder, &s.token_addr, &recipients, &amounts, &30);
+        assert_eq!(partial_res.processed_count, 30);
+        assert_eq!(partial_res.remaining_count, size - 30);
+        assert_eq!(partial_res.requested_count, size);
+    }
+}
+
+#[test]
+fn test_fuzz_random_batch_amounts_boundary_100() {
+    let s = Setup::new();
+
+    // Pseudo-random pseudo-fuzz generator
+    let mut seed = 0xdeadbeef_u64;
+    let mut next_rand = || -> i128 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ((seed >> 33) % 10_000 + 1) as i128
+    };
+
+    // Test variations with sizes [99, 100, 101] and random non-zero amounts
+    for &size in &[99u32, 100u32, 101u32] {
+        let mut recipients = Vec::new(&s.env);
+        let mut amounts = Vec::new(&s.env);
+        for _ in 0..size {
+            recipients.push_back(Address::generate(&s.env));
+            amounts.push_back(next_rand());
+        }
+
+        s.env.budget().reset_unlimited();
+        s.env.budget().reset_tracker();
+        let res = s.client.try_process_batch(&s.funder, &s.token_addr, &recipients, &amounts);
+        assert_eq!(res, Err(Ok(Error::BatchTooLarge)));
+        let cpu = s.env.budget().cpu_instruction_cost();
+        assert!(cpu < 800_000, "fuzz batch {size} exceeded gas budget: {cpu}");
+    }
+}

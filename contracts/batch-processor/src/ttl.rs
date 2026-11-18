@@ -13,6 +13,48 @@ use soroban_sdk::{contracttype, token, Address, Env};
 
 pub use drip_common::ttl::bump_instance as bump;
 
+/// Automated key and instance TTL extension helpers (Issue #762).
+
+/// Bumps temporary storage key TTL to default thresholds.
+pub fn bump_temporary_key<K: soroban_sdk::IntoVal<Env, soroban_sdk::Val>>(env: &Env, key: &K) {
+    env.storage().temporary().extend_ttl(
+        key,
+        drip_common::ttl::MIN_TTL_LEDGERS,
+        drip_common::ttl::EXTEND_TTL_LEDGERS,
+    );
+}
+
+/// Extends active batch execution state and instance storage TTL (Issue #762).
+pub fn bump_batch_state(env: &Env) {
+    bump(env);
+    if env.storage().temporary().has(&crate::DataKey::ReentrancyLock) {
+        bump_temporary_key(env, &crate::DataKey::ReentrancyLock);
+    }
+}
+
+/// Bumps batch processor instance and temporary state TTL to match a target stream's expiration (Issue #762).
+pub fn bump_to_match_stream_expiration(env: &Env, target_stream_expiration_ledger: u32) {
+    let current_ledger = env.ledger().sequence();
+    if target_stream_expiration_ledger > current_ledger {
+        let ledgers_remaining = target_stream_expiration_ledger - current_ledger;
+        let extend_to = ledgers_remaining.max(drip_common::ttl::EXTEND_TTL_LEDGERS);
+        let min_ttl = (extend_to / 2).max(drip_common::ttl::MIN_TTL_LEDGERS);
+        env.storage().instance().extend_ttl(min_ttl, extend_to);
+        if env.storage().temporary().has(&crate::DataKey::ReentrancyLock) {
+            env.storage()
+                .temporary()
+                .extend_ttl(&crate::DataKey::ReentrancyLock, min_ttl, extend_to);
+        }
+    } else {
+        bump_batch_state(env);
+    }
+}
+
+/// Automated helper to extend instance and all active temporary keys (Issue #762).
+pub fn bump_instance_and_keys(env: &Env) {
+    bump_batch_state(env);
+}
+
 /// Maintenance reserve pool used to reimburse keepers for extending contract TTL (Issue #817).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]

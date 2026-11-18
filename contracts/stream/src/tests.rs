@@ -524,7 +524,7 @@ fn top_up_increases_contract_balance() {
     let stream_before = s.token.balance(&s.client.address);
     s.client.top_up(&s.sender, &50_000);
     assert_eq!(s.token.balance(&s.client.address), stream_before + 50_000);
-    assert_eq!(s.client.cumulative_deposited().unwrap(), 410_000);
+    assert_eq!(s.client.cumulative_deposited(), 410_000);
 }
 
 #[test]
@@ -3034,4 +3034,36 @@ fn long_streams_get_a_longer_instance_ttl_than_short_streams() {
         long_ttl > short_ttl,
         "one-year stream TTL {long_ttl} must exceed one-hour stream TTL {short_ttl}"
     );
+}
+
+// ── Issue #810: secondary backup recovery address in stream state ───────────
+
+#[test]
+fn recovery_address_configuration_and_timelocked_claim() {
+    let s = Setup::new(1, 3_600, false);
+    let recovery = Address::generate(&s.env);
+    let new_recipient = Address::generate(&s.env);
+
+    // Recipient configures secondary backup recovery address with 300s timelock delay
+    s.client.set_recovery_address(&recovery, &300);
+    assert_eq!(s.client.recovery_address(), Some(recovery.clone()));
+    let claimable_at = s.client.recovery_claimable_at().unwrap();
+    assert_eq!(claimable_at, s.env.ledger().timestamp() + 300);
+
+    // Premature claim fails
+    assert_eq!(
+        s.client.try_claim_recovery(&new_recipient),
+        Err(Ok(Error::InvalidTimeRange))
+    );
+
+    // Advance time past the timelock
+    s.env.ledger().with_mut(|l| l.timestamp += 301);
+
+    // Recovery address successfully claims stream, updating recipient
+    assert!(s.client.try_claim_recovery(&new_recipient).is_ok());
+    assert_eq!(s.client.recipient(), new_recipient);
+
+    // Recovery config is cleared after successful claim
+    assert_eq!(s.client.recovery_address(), None);
+    assert_eq!(s.client.recovery_claimable_at(), None);
 }

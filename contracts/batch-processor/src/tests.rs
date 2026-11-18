@@ -771,3 +771,57 @@ fn bench_oversized_batches_are_rejected_cheaply() {
         );
     }
 }
+
+// ── Issue #816: gas-optimized batch cancel ──────────────────────────────────
+
+#[test]
+fn batch_cancel_cancels_multiple_streams() {
+    let s = Setup::new();
+    let caller = Address::generate(&s.env);
+
+    // Empty batch cancel succeeds with 0
+    let empty_streams = Vec::new(&s.env);
+    assert_eq!(s.client.batch_cancel(&caller, &empty_streams), 0);
+
+    // Oversized batch cancel returns BatchTooLarge
+    let mut oversized = Vec::new(&s.env);
+    for _ in 0..(MAX_BATCH_SIZE + 1) {
+        oversized.push_back(Address::generate(&s.env));
+    }
+    assert_eq!(
+        s.client.try_batch_cancel(&caller, &oversized),
+        Err(Ok(Error::BatchTooLarge))
+    );
+}
+
+// ── Issue #817: keeper incentive rebate check in batch processing TTL bump ──
+
+#[test]
+fn keeper_maintenance_reserve_rebate() {
+    let s = Setup::new();
+    let admin = Address::generate(&s.env);
+    s.client.initialize(&admin);
+
+    let keeper = Address::generate(&s.env);
+    let rebate_amount = 5_000_i128;
+
+    // Configure maintenance reserve
+    s.client.configure_maintenance_reserve(&admin, &s.token_addr, &rebate_amount);
+    let reserve = s.client.maintenance_reserve().unwrap();
+    assert_eq!(reserve.rebate_amount, rebate_amount);
+    assert_eq!(reserve.balance, 0);
+
+    // Bump without funds pays zero rebate
+    let paid = s.client.bump_ttl_with_rebate(&keeper);
+    assert_eq!(paid, 0);
+
+    // Fund the maintenance reserve
+    s.client.fund_maintenance_reserve(&s.funder, &15_000);
+    assert_eq!(s.client.maintenance_reserve().unwrap().balance, 15_000);
+
+    // Bump with funds pays the keeper rebate
+    let paid = s.client.bump_ttl_with_rebate(&keeper);
+    assert_eq!(paid, rebate_amount);
+    assert_eq!(s.client.maintenance_reserve().unwrap().balance, 10_000);
+    assert_eq!(s.token.balance(&keeper), rebate_amount);
+}

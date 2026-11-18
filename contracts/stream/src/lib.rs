@@ -1294,7 +1294,7 @@ impl DripStream {
         let split_opt: Option<SplitConfig> = env.storage().instance().get(&DataKey::SplitConfig);
         if let Some(split) = split_opt {
             let secondary_amount =
-                math::mul_div(env, to_send, split.split_bps as u128, 10_000)?;
+                math::mul_div(&env, to_send, split.split_bps as u128, 10_000)?;
             to_send
                 .checked_sub(secondary_amount)
                 .ok_or(Error::ArithmeticOverflow)?;
@@ -1452,8 +1452,100 @@ impl DripStream {
         updated.recipient = new_recipient.clone();
         state::save(env, &updated);
         env.storage().instance().remove(&DataKey::AutoForwardAddress);
+        env.storage().instance().remove(&DataKey::RecoveryAddress);
+        env.storage().instance().remove(&DataKey::RecoveryClaimableAt);
         events::recipient_transferred(env, &info.recipient, &new_recipient);
         Ok(())
+    }
+
+    /// Configure secondary backup recovery address in stream state (Issue #810).
+    ///
+    /// Recipient-only configuration. Sets a secondary recovery address that can
+    /// claim stream control after `timelock_delay_seconds`.
+    pub fn set_recovery_address(
+        env: Env,
+        recovery_address: Address,
+        timelock_delay_seconds: u64,
+    ) -> Result<(), Error> {
+        state::with_guard(&env, |env| {
+            ttl::bump(env);
+            let info = state::load(env);
+            state::assert_not_cancelled(&info)?;
+            info.recipient.require_auth();
+
+            if is_zero_address(env, &recovery_address) || recovery_address == info.recipient {
+                return Err(Error::InvalidRecipient);
+            }
+
+            let claimable_at = env
+                .ledger()
+                .timestamp()
+                .saturating_add(timelock_delay_seconds);
+
+            env.storage()
+                .instance()
+                .set(&DataKey::RecoveryAddress, &recovery_address);
+            env.storage()
+                .instance()
+                .set(&DataKey::RecoveryClaimableAt, &claimable_at);
+
+            Ok(())
+        })
+    }
+
+    /// Read-only: get configured secondary backup recovery address (Issue #810).
+    pub fn recovery_address(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::RecoveryAddress)
+    }
+
+    /// Read-only: get timestamp when recovery claim becomes executable (Issue #810).
+    pub fn recovery_claimable_at(env: Env) -> Option<u64> {
+        env.storage().instance().get(&DataKey::RecoveryClaimableAt)
+    }
+
+    /// Execute timelocked recovery claim by authorized backup recovery address (Issue #810).
+    ///
+    /// Replaces the lost recipient with `new_recipient` after the timelock delay expires.
+    pub fn claim_recovery(env: Env, new_recipient: Address) -> Result<(), Error> {
+        state::with_guard(&env, |env| {
+            ttl::bump(env);
+            let info = state::load(env);
+            state::assert_not_cancelled(&info)?;
+
+            let recovery_addr: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::RecoveryAddress)
+                .ok_or(Error::NotAuthorized)?;
+            let claimable_at: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::RecoveryClaimableAt)
+                .unwrap_or(0);
+
+            recovery_addr.require_auth();
+
+            if is_zero_address(env, &new_recipient) || new_recipient == info.sender {
+                return Err(Error::InvalidRecipient);
+            }
+
+            let now = env.ledger().timestamp();
+            if now < claimable_at {
+                return Err(Error::InvalidTimeRange);
+            }
+
+            let mut updated = info.clone();
+            let old_recipient = updated.recipient.clone();
+            updated.recipient = new_recipient.clone();
+            state::save(env, &updated);
+
+            env.storage().instance().remove(&DataKey::AutoForwardAddress);
+            env.storage().instance().remove(&DataKey::RecoveryAddress);
+            env.storage().instance().remove(&DataKey::RecoveryClaimableAt);
+
+            events::recipient_transferred(env, &old_recipient, &new_recipient);
+            Ok(())
+        })
     }
 
     /// Set the address that receives future payouts for this stream.

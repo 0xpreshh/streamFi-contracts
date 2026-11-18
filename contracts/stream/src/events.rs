@@ -134,6 +134,23 @@ pub fn paused(env: &Env, initiator: &Address, paused_at: u64, withdrawable: i128
     );
 }
 
+/// Emitted when a stream is paused specifically by the recipient (Issue #754).
+///
+/// Topics: `("StreamPausedByRecipient", recipient)`
+/// Data:   `(paused_at, withdrawable)`
+pub fn stream_paused_by_recipient(
+    env: &Env,
+    recipient: &Address,
+    paused_at: u64,
+    withdrawable: i128,
+) {
+    assert_non_negative_amount(env, withdrawable);
+    env.events().publish(
+        (Symbol::new(env, "StreamPausedByRecipient"), recipient.clone()),
+        (paused_at, withdrawable),
+    );
+}
+
 pub fn resumed(env: &Env, initiator: &Address, resumed_at: u64) {
     let sequence = next_sequence(env);
     env.events().publish(

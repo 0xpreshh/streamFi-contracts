@@ -50,6 +50,8 @@ pub enum DataKey {
     TrackedVaultKeys,
     /// Balances per user per token for faster account lookup (Issue #757).
     DepositorTokens(Address, Address),
+    /// Persistent storage: optional minimum deposit amount threshold per token (Issue #756).
+    TokenMinDeposit(Address),
 }
 
 #[contracttype]
@@ -228,6 +230,21 @@ pub fn get_depositor_token_balance(env: &Env, depositor: &Address, token: &Addre
 pub fn set_depositor_token_balance(env: &Env, depositor: &Address, token: &Address, balance: i128) {
     let key = DataKey::DepositorTokens(depositor.clone(), token.clone());
     env.storage().persistent().set(&key, &balance);
+    drip_common::ttl::bump_persistent(env, &key);
+}
+
+/// Returns minimum deposit amount threshold for a token (Issue #756).
+pub fn get_token_min_deposit(env: &Env, token: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::TokenMinDeposit(token.clone()))
+        .unwrap_or(0)
+}
+
+/// Sets minimum deposit amount threshold for a token (Issue #756).
+pub fn set_token_min_deposit(env: &Env, token: &Address, min_amount: i128) {
+    let key = DataKey::TokenMinDeposit(token.clone());
+    env.storage().persistent().set(&key, &min_amount);
     drip_common::ttl::bump_persistent(env, &key);
 }
 

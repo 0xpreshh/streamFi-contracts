@@ -3236,3 +3236,72 @@ fn test_emergency_extend_stream_ttl_unauthenticated() {
     assert_eq!(s.token.balance(&s.client.address), 3_600);
     assert_eq!(s.client.info().withdrawn, 0);
 }
+
+// ── Issues #753-#755: is_depleted, pause_by_recipient, cancel_with_reason ──
+
+#[test]
+fn test_is_depleted_helper_method() {
+    let s = Setup::new(10, 100, false);
+    // At start, not depleted
+    assert_eq!(s.client.is_depleted(), false);
+    let mut info = s.client.info();
+    assert_eq!(info.is_depleted(), false);
+    assert_eq!(crate::state::is_depleted(&info), false);
+
+    // Advance to end and withdraw everything
+    s.advance_secs(100);
+    s.client.withdraw(&1_000);
+    assert_eq!(s.client.is_depleted(), true);
+    info = s.client.info();
+    assert_eq!(info.is_depleted(), true);
+    assert_eq!(crate::state::is_depleted(&info), true);
+
+    // Cancelled stream is also depleted
+    let s2 = Setup::new(10, 100, false);
+    s2.client.cancel(&s2.sender);
+    assert_eq!(s2.client.is_depleted(), true);
+    let info2 = s2.client.info();
+    assert_eq!(info2.is_depleted(), true);
+    assert_eq!(crate::state::is_depleted(&info2), true);
+}
+
+#[test]
+fn test_recipient_initiated_pause() {
+    let s = Setup::new(10, 100, false);
+    s.advance_secs(20);
+
+    // Non-recipient cannot call pause_by_recipient
+    let stranger = Address::generate(&s.env);
+    assert_eq!(
+        s.client.try_pause_by_recipient(&stranger),
+        Err(Ok(Error::NotAuthorized))
+    );
+
+    // Recipient can pause
+    let res = s.client.try_pause_by_recipient(&s.recipient);
+    assert!(res.is_ok());
+    assert_eq!(s.client.info().is_paused(), true);
+
+    // Calling again returns AlreadyPaused
+    assert_eq!(
+        s.client.try_pause_by_recipient(&s.recipient),
+        Err(Ok(Error::AlreadyPaused))
+    );
+}
+
+#[test]
+fn test_cancel_with_reason_stored_in_persistent_storage() {
+    let s = Setup::new(10, 100, false);
+    s.advance_secs(40);
+
+    // Cancel with reason 42
+    let res = s.client.try_cancel_with_reason(&s.sender, &42);
+    assert!(res.is_ok());
+
+    let record = s.client.cancellation_record().expect("record must exist");
+    assert_eq!(record.cancellation_reason, 42);
+    assert_eq!(record.cancelled_by, s.sender);
+    assert_eq!(record.cancelled_at, 1_000_000 + 40);
+    assert_eq!(record.refund_amount, 600);
+}
+

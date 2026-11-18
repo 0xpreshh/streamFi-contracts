@@ -601,6 +601,22 @@ impl DripFactory {
         MAX_BATCH_SIZE
     }
 
+    /// Derives deterministic deployment salt from sender, recipient, nonce, and token (Issue #764).
+    pub fn derive_salt(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        nonce: u64,
+        token: Address,
+    ) -> BytesN<32> {
+        deploy::derive_salt(&env, &sender, &recipient, nonce, &token)
+    }
+
+    /// Read-only helper: derives deterministic salt from stream ID (Issue #684).
+    pub fn compute_salt(env: Env, stream_id: u64) -> BytesN<32> {
+        deploy::compute_salt(&env, stream_id)
+    }
+
     /// Cancel multiple streams in one transaction, all authorized by the
     /// same `sender`.
     ///

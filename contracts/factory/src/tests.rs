@@ -1361,3 +1361,38 @@ fn test_accumulated_fee_tracking() {
     });
     assert_eq!(s.client.accumulated_fee(&token), 750);
 }
+
+#[test]
+fn test_deterministic_salt_generation() {
+    let s = Setup::new();
+    let sender = Address::generate(&s.env);
+    let recipient = Address::generate(&s.env);
+    let token = Address::generate(&s.env);
+    let nonce = 123u64;
+
+    let salt1 = s.client.derive_salt(&sender, &recipient, &nonce, &token);
+    let salt2 = s.client.derive_salt(&sender, &recipient, &nonce, &token);
+    assert_eq!(salt1, salt2);
+
+    let helper_salt = crate::deploy::derive_salt(&s.env, &sender, &recipient, nonce, &token);
+    assert_eq!(salt1, helper_salt);
+
+    // Different nonce produces different salt
+    let salt_diff_nonce = s.client.derive_salt(&sender, &recipient, &(nonce + 1), &token);
+    assert_ne!(salt1, salt_diff_nonce);
+
+    // Different recipient produces different salt
+    let other_recipient = Address::generate(&s.env);
+    let salt_diff_recipient = s.client.derive_salt(&sender, &other_recipient, &nonce, &token);
+    assert_ne!(salt1, salt_diff_recipient);
+
+    // Different sender produces different salt
+    let other_sender = Address::generate(&s.env);
+    let salt_diff_sender = s.client.derive_salt(&other_sender, &recipient, &nonce, &token);
+    assert_ne!(salt1, salt_diff_sender);
+
+    // Different token produces different salt
+    let other_token = Address::generate(&s.env);
+    let salt_diff_token = s.client.derive_salt(&sender, &recipient, &nonce, &other_token);
+    assert_ne!(salt1, salt_diff_token);
+}

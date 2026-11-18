@@ -8,7 +8,7 @@ mod tests;
 use drip_common::is_zero_address;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env,
-    Symbol, Vec,
+    IntoVal, Symbol, Vec,
 };
 
 pub use ttl::MaintenanceReserve;
@@ -661,6 +661,109 @@ impl BatchTransferProcessor {
         );
 
         Ok(cancelled_count)
+    }
+
+    /// Lenient batch withdrawal across multiple streams (Issue #761).
+    ///
+    /// Catches execution errors per stream so a single failing or revoked stream does not
+    /// revert the remaining payouts.
+    /// Returns a vector of tuples: `(stream_id, success, error_code)`.
+    pub fn batch_withdraw_lenient(
+        env: Env,
+        stream_ids: Vec<Address>,
+        amounts: Vec<i128>,
+    ) -> Result<Vec<(Address, bool, u32)>, Error> {
+        if stream_ids.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+        if !amounts.is_empty() && amounts.len() != stream_ids.len() {
+            return Err(Error::LengthMismatch);
+        }
+
+        let mut results = Vec::new(&env);
+        if stream_ids.is_empty() {
+            return Ok(results);
+        }
+
+        ttl::bump_batch_state(&env);
+
+        if env.storage().temporary().has(&DataKey::ReentrancyLock) {
+            return Err(Error::ReentrancyForbidden);
+        }
+        env.storage()
+            .temporary()
+            .set(&DataKey::ReentrancyLock, &true);
+
+        for (idx, stream_id) in stream_ids.iter().enumerate() {
+            let amount = if amounts.is_empty() {
+                // Query withdrawable amount if not provided
+                let withdrawable_res = env.try_invoke_contract::<i128, soroban_sdk::Error>(
+                    &stream_id,
+                    &Symbol::new(&env, "withdrawable"),
+                    Vec::new(&env),
+                );
+                match withdrawable_res {
+                    Ok(Ok(val)) => val,
+                    _ => 0,
+                }
+            } else {
+                amounts.get(idx as u32).unwrap_or(0)
+            };
+
+            if amount <= 0 {
+                results.push_back((stream_id.clone(), false, Error::InvalidAmount as u32));
+                continue;
+            }
+
+            let mut args = Vec::new(&env);
+            args.push_back(amount.into_val(&env));
+
+            let res = env.try_invoke_contract::<i128, soroban_sdk::Error>(
+                &stream_id,
+                &Symbol::new(&env, "withdraw"),
+                args,
+            );
+
+            match res {
+                Ok(Ok(_)) => {
+                    results.push_back((stream_id.clone(), true, 0));
+                }
+                Ok(Err(err)) => {
+                    results.push_back((stream_id.clone(), false, err.get_code()));
+                }
+                Err(Ok(err)) => {
+                    results.push_back((stream_id.clone(), false, err.get_code()));
+                }
+                Err(Err(soroban_sdk::InvokeError::Contract(code))) => {
+                    results.push_back((stream_id.clone(), false, code));
+                }
+                Err(Err(soroban_sdk::InvokeError::Abort)) => {
+                    results.push_back((stream_id.clone(), false, 9999));
+                }
+            }
+        }
+
+        env.storage().temporary().remove(&DataKey::ReentrancyLock);
+
+        env.events().publish(
+            (Symbol::new(&env, "batch_withdrawn_lenient"), env.current_contract_address()),
+            (results.len(), stream_ids.len()),
+        );
+
+        Ok(results)
+    }
+
+    /// Extend batch processor storage TTL to match target stream expiration (Issue #762).
+    pub fn bump_ttl_to_stream_expiration(
+        env: Env,
+        target_stream_ledger: u32,
+    ) {
+        ttl::bump_to_match_stream_expiration(&env, target_stream_ledger);
+    }
+
+    /// Automated helper to extend instance and all active temporary keys (Issue #762).
+    pub fn bump_instance_and_keys(env: Env) {
+        ttl::bump_instance_and_keys(&env);
     }
 
     /// Admin-gated configuration for batch processor keeper maintenance rebate (Issue #817).

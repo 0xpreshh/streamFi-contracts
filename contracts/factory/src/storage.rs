@@ -317,4 +317,12 @@ pub enum DataKey {
     CancelledStream(Address),
     /// **Persistent storage.** Number of streams deployed using a specific token (Issue #720).
     TokenStreamCount(Address),
+    /// **Persistent storage.** Cumulative protocol fee revenue accumulated per token asset (Issue #768).
+    AccumulatedFee(Address),
+    /// **Instance storage.** Granular pause level for creation vs emergency operations (Issue #767).
+    PauseLevel,
+    /// **Instance storage.** Pending protocol fee update proposal under timelock (Issue #766).
+    PendingFeeUpdate,
+    /// **Instance storage.** Active protocol fee in basis points when set via timelocked execution (Issue #766).
+    ProtocolFeeBps,
 }

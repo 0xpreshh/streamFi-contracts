@@ -421,3 +421,21 @@ pub fn stream_count_by_recipient(env: &Env, recipient: Address) -> u32 {
     let legacy_key = DataKey::ByRecipient(recipient);
     count_index(env, &count_key, &legacy_key)
 }
+
+/// Returns paginated stream addresses where `recipient` is the beneficiary (Issue #765).
+pub fn get_streams_by_recipient(
+    env: &Env,
+    recipient: Address,
+    start_index: u32,
+    limit: u32,
+) -> Vec<Address> {
+    let page = streams_by_recipient(env, recipient, start_index, limit);
+    let mut addrs = Vec::new(env);
+    for id in page.ids.iter() {
+        let key = DataKey::StreamAddr(id);
+        if let Some(addr) = env.storage().persistent().get::<_, Address>(&key) {
+            addrs.push_back(addr);
+        }
+    }
+    addrs
+}

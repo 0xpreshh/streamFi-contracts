@@ -81,6 +81,80 @@ pub fn enforce_bounds(
     Ok(())
 }
 
+/// Minimum timelock delay required before a proposed fee update can be executed (Issue #766).
+pub const MIN_DELAY: u32 = 17_280; // ~1 day on Soroban at 5s/ledger
+
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeUpdateProposal {
+    pub proposed_fee_bps: u32,
+    pub proposed_at_ledger: u32,
+    pub eta_ledger: u32,
+}
+
+/// Proposes a protocol fee update subject to a timelock delay of at least `MIN_DELAY` ledgers (Issue #766).
+pub fn propose_fee_update(env: &Env, proposed_fee_bps: u32) -> Result<u32, Error> {
+    if proposed_fee_bps > 10_000 {
+        return Err(Error::InvalidFee);
+    }
+    let current_ledger = env.ledger().sequence();
+    let eta_ledger = current_ledger.saturating_add(MIN_DELAY);
+    let proposal = FeeUpdateProposal {
+        proposed_fee_bps,
+        proposed_at_ledger: current_ledger,
+        eta_ledger,
+    };
+    env.storage()
+        .instance()
+        .set(&crate::storage::DataKey::PendingFeeUpdate, &proposal);
+    crate::events::fee_update_proposed(env, proposed_fee_bps, eta_ledger);
+    Ok(eta_ledger)
+}
+
+/// Executes a pending protocol fee update once `MIN_DELAY` ledgers have elapsed (Issue #766).
+pub fn execute_fee_update(env: &Env) -> Result<(), Error> {
+    let proposal: FeeUpdateProposal = env
+        .storage()
+        .instance()
+        .get(&crate::storage::DataKey::PendingFeeUpdate)
+        .ok_or(Error::NoPendingFeeUpdate)?;
+
+    let current_ledger = env.ledger().sequence();
+    if current_ledger < proposal.eta_ledger {
+        return Err(Error::TimelockNotMet);
+    }
+
+    let old_fee_bps = env
+        .storage()
+        .instance()
+        .get(&crate::storage::DataKey::ProtocolFeeBps)
+        .unwrap_or(30);
+
+    env.storage()
+        .instance()
+        .set(&crate::storage::DataKey::ProtocolFeeBps, &proposal.proposed_fee_bps);
+    env.storage()
+        .instance()
+        .remove(&crate::storage::DataKey::PendingFeeUpdate);
+
+    crate::events::fee_update_executed(env, old_fee_bps, proposal.proposed_fee_bps);
+    Ok(())
+}
+
+/// Read pending fee update proposal, if any (Issue #766).
+pub fn pending_fee_update(env: &Env) -> Option<FeeUpdateProposal> {
+    env.storage()
+        .instance()
+        .get(&crate::storage::DataKey::PendingFeeUpdate)
+}
+
+/// Read active protocol fee override if set via timelocked execution.
+pub fn active_fee_bps(env: &Env) -> Option<u32> {
+    env.storage()
+        .instance()
+        .get(&crate::storage::DataKey::ProtocolFeeBps)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,6 +175,8 @@ mod tests {
             force_cancel_pause_secs: 30 * DAY,
             min_quorum_bps: 0,
             voting_period_ledgers: 17_280,
+            proposal_stake_token: None,
+            min_proposal_stake: 0,
         }
     }
 

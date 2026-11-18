@@ -5,7 +5,7 @@
 extern crate std;
 
 use soroban_sdk::{
-    testutils::{Address as _, Events as _},
+    testutils::{Address as _, Events as _, Ledger as _},
     Address, BytesN, Env,
 };
 
@@ -1216,4 +1216,148 @@ fn create_stream_rejects_a_description_over_128_bytes() {
     );
 
     assert_eq!(result, Err(Ok(Error::DescriptionTooLong)));
+}
+
+#[test]
+fn test_get_streams_by_recipient_pagination() {
+    let s = Setup::new();
+    let recipient = Address::generate(&s.env);
+    let stream1 = Address::generate(&s.env);
+    let stream2 = Address::generate(&s.env);
+    let stream3 = Address::generate(&s.env);
+
+    s.env.as_contract(&s.client.address, || {
+        let mut ids = soroban_sdk::Vec::new(&s.env);
+        ids.push_back(10u64);
+        ids.push_back(20u64);
+        ids.push_back(30u64);
+        s.env
+            .storage()
+            .persistent()
+            .set(&DataKey::ByRecipient(recipient.clone()), &ids);
+        s.env
+            .storage()
+            .persistent()
+            .set(&DataKey::StreamAddr(10u64), &stream1);
+        s.env
+            .storage()
+            .persistent()
+            .set(&DataKey::StreamAddr(20u64), &stream2);
+        s.env
+            .storage()
+            .persistent()
+            .set(&DataKey::StreamAddr(30u64), &stream3);
+    });
+
+    // Page 0 with limit 2 (Issue #765)
+    let paged0 = s.client.get_streams_by_recipient(&recipient, &0, &2);
+    assert_eq!(paged0.len(), 2);
+    assert_eq!(paged0.get(0).unwrap(), stream1);
+    assert_eq!(paged0.get(1).unwrap(), stream2);
+
+    // Page with start_index 2 with limit 2
+    let paged1 = s.client.get_streams_by_recipient(&recipient, &2, &2);
+    assert_eq!(paged1.len(), 1);
+    assert_eq!(paged1.get(0).unwrap(), stream3);
+
+    // Using alias get_streams_by_recipient_paged
+    let paged_alias = s.client.get_streams_by_recipient_paged(&recipient, &1, &1);
+    assert_eq!(paged_alias.len(), 1);
+    assert_eq!(paged_alias.get(0).unwrap(), stream2);
+}
+
+#[test]
+fn test_timelock_delay_protocol_fee_updates() {
+    let s = Setup::new();
+
+    // No pending update initially (Issue #766)
+    assert_eq!(s.client.pending_fee_update(), None);
+
+    // Proposing fee > 10_000 fails with InvalidFee
+    assert_eq!(
+        s.client.try_propose_fee_update(&10_001),
+        Err(Ok(Error::InvalidFee))
+    );
+
+    // Proposing valid fee succeeds
+    let eta_ledger = s.client.propose_fee_update(&150);
+    let pending = s.client.pending_fee_update().unwrap();
+    assert_eq!(pending.proposed_fee_bps, 150);
+    assert_eq!(pending.eta_ledger, eta_ledger);
+
+    // Attempting to execute before eta_ledger fails with TimelockNotMet
+    assert_eq!(
+        s.client.try_execute_fee_update(),
+        Err(Ok(Error::TimelockNotMet))
+    );
+
+    // Advance ledger sequence to eta_ledger
+    s.env.ledger().with_mut(|l| l.sequence_number = eta_ledger);
+
+    // Execution succeeds
+    assert!(s.client.try_execute_fee_update().is_ok());
+
+    // Protocol fee bps now reflects updated fee
+    assert_eq!(s.client.protocol_fee_bps(), 150);
+    assert_eq!(s.client.pending_fee_update(), None);
+
+    // Executing again without a new proposal fails with NoPendingFeeUpdate
+    assert_eq!(
+        s.client.try_execute_fee_update(),
+        Err(Ok(Error::NoPendingFeeUpdate))
+    );
+}
+
+#[test]
+fn test_granular_pause_levels() {
+    let s = Setup::new();
+
+    // Default pause level is Unpaused (Issue #767)
+    assert_eq!(s.client.pause_level(), crate::pause::PauseType::Unpaused);
+    assert!(!s.client.is_paused());
+
+    // Pause with CreationOnly level
+    s.client.pause_with_level(&crate::pause::PauseType::CreationOnly);
+    assert_eq!(s.client.pause_level(), crate::pause::PauseType::CreationOnly);
+    assert!(s.client.is_paused());
+
+    // Pausing with same level returns AlreadyPaused
+    assert_eq!(
+        s.client.try_pause_with_level(&crate::pause::PauseType::CreationOnly),
+        Err(Ok(Error::AlreadyPaused))
+    );
+
+    // Switch to FullEmergency
+    s.client.pause_with_level(&crate::pause::PauseType::FullEmergency);
+    assert_eq!(s.client.pause_level(), crate::pause::PauseType::FullEmergency);
+    assert!(s.client.is_paused());
+
+    // Unpause brings it back to Unpaused
+    s.client.unpause();
+    assert_eq!(s.client.pause_level(), crate::pause::PauseType::Unpaused);
+    assert!(!s.client.is_paused());
+}
+
+#[test]
+fn test_accumulated_fee_tracking() {
+    let s = Setup::new();
+    let token = Address::generate(&s.env);
+
+    // Initial accumulated fee is 0 (Issue #768)
+    assert_eq!(s.client.accumulated_fee(&token), 0);
+
+    // Simulate fee accumulation in storage
+    s.env.as_contract(&s.client.address, || {
+        let acc_key = DataKey::AccumulatedFee(token.clone());
+        s.env.storage().persistent().set(&acc_key, &500_i128);
+    });
+    assert_eq!(s.client.accumulated_fee(&token), 500);
+
+    // Further fee accumulation
+    s.env.as_contract(&s.client.address, || {
+        let acc_key = DataKey::AccumulatedFee(token.clone());
+        let cur: i128 = s.env.storage().persistent().get(&acc_key).unwrap();
+        s.env.storage().persistent().set(&acc_key, &(cur + 250));
+    });
+    assert_eq!(s.client.accumulated_fee(&token), 750);
 }

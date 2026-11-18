@@ -20,6 +20,8 @@ use soroban_sdk::{
 use drip_common::is_zero_address;
 
 pub use errors::Error;
+pub use governance::FeeUpdateProposal;
+pub use pause::PauseType;
 use storage::DataKey;
 pub use storage::{
     Aggregate, BatchStreamRequest, FactoryStatus, FeeEstimate, StreamInitParams, StreamOperation,
@@ -115,7 +117,7 @@ impl DripFactory {
         // rejects new streams immediately, without pulling a deposit or paying
         // a TTL extension. Already-deployed streams are independent contracts
         // and are unaffected by this flag.
-        pause::require_not_paused(&env)?;
+        pause::require_creation_allowed(&env)?;
 
         // ── Validation ───────────────────────────────────────────────────
         let now = Self::validate_stream_request(
@@ -294,6 +296,12 @@ impl DripFactory {
         // either commits or the whole creation rolls back.
         if fee > 0 {
             tk.transfer(&factory_addr, &fee_recipient, &fee);
+            let acc_key = DataKey::AccumulatedFee(token.clone());
+            let current_acc: i128 = env.storage().persistent().get(&acc_key).unwrap_or(0);
+            let new_acc = current_acc.checked_add(fee).ok_or(Error::ArithmeticOverflow)?;
+            env.storage().persistent().set(&acc_key, &new_acc);
+            ttl::bump_persistent(&env, &acc_key);
+            events::protocol_fee_collected(&env, &token, &fee_recipient, fee);
         }
         events::protocol_fee_charged(&env, &fee_recipient, fee);
 
@@ -448,7 +456,7 @@ impl DripFactory {
             return Err(Error::BatchTooLarge);
         }
 
-        pause::require_not_paused(&env)?;
+        pause::require_creation_allowed(&env)?;
 
         let governor: Address = env
             .storage()
@@ -517,7 +525,7 @@ impl DripFactory {
 
         // ── Auth / pause ─────────────────────────────────────────────────
         sender.require_auth();
-        pause::require_not_paused(&env)?;
+        pause::require_creation_allowed(&env)?;
 
         // ── Fetch governor config once for the whole batch ───────────────
         let governor: Address = env
@@ -836,6 +844,26 @@ impl DripFactory {
         index::streams_by_recipient(&env, recipient, offset, limit)
     }
 
+    /// Returns paginated stream contract addresses where `recipient` is the beneficiary (Issue #765).
+    pub fn get_streams_by_recipient(
+        env: Env,
+        recipient: Address,
+        start_index: u32,
+        limit: u32,
+    ) -> Vec<Address> {
+        index::get_streams_by_recipient(&env, recipient, start_index, limit)
+    }
+
+    /// Alias for [`Self::get_streams_by_recipient`] with `paged` suffix (Issue #765).
+    pub fn get_streams_by_recipient_paged(
+        env: Env,
+        recipient: Address,
+        start_index: u32,
+        limit: u32,
+    ) -> Vec<Address> {
+        Self::get_streams_by_recipient(env, recipient, start_index, limit)
+    }
+
     /// Total number of streams created by `sender`.
     ///
     /// Mirrors the global `stream_count` but scoped to one sender, so clients
@@ -904,6 +932,9 @@ impl DripFactory {
     /// Callers that want the old lenient behaviour should use
     /// [`Self::protocol_fee_bps_or_default`].
     pub fn protocol_fee_bps(env: Env) -> Result<u32, Error> {
+        if let Some(fee) = governance::active_fee_bps(&env) {
+            return Ok(fee);
+        }
         let governor: Option<Address> = env.storage().instance().get(&DataKey::GovernorAddress);
         let governor = governor.ok_or(Error::NotInitialized)?;
         governance::config(&env, &governor).map(|c| c.fee_bps)
@@ -1086,6 +1117,66 @@ impl DripFactory {
             is_paused: Self::is_paused(env.clone()),
             protocol_fee_bps: Self::protocol_fee_bps(env).ok(),
         }
+    }
+
+    /// Pause factory with a specific PauseType level (Issue #767).
+    pub fn pause_with_level(env: Env, level: pause::PauseType) -> Result<(), Error> {
+        let governor: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernorAddress)
+            .ok_or(Error::NotInitialized)?;
+        governor.require_auth();
+        if pause::pause_level(&env) == level {
+            return Err(Error::AlreadyPaused);
+        }
+        ttl::bump_instance(&env);
+        ttl::bump_persistent_bucket(&env);
+        pause::set_pause_level(&env, level);
+        events::paused(&env, &governor, env.ledger().timestamp());
+        Ok(())
+    }
+
+    /// Read-only: granular pause level (Issue #767).
+    pub fn pause_level(env: Env) -> pause::PauseType {
+        pause::pause_level(&env)
+    }
+
+    /// Proposes a protocol fee update subject to MIN_DELAY timelock (Issue #766).
+    pub fn propose_fee_update(env: Env, proposed_fee_bps: u32) -> Result<u32, Error> {
+        let governor: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernorAddress)
+            .ok_or(Error::NotInitialized)?;
+        governor.require_auth();
+        ttl::bump_instance(&env);
+        governance::propose_fee_update(&env, proposed_fee_bps)
+    }
+
+    /// Executes a pending protocol fee update after MIN_DELAY ledgers have elapsed (Issue #766).
+    pub fn execute_fee_update(env: Env) -> Result<(), Error> {
+        let governor: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernorAddress)
+            .ok_or(Error::NotInitialized)?;
+        governor.require_auth();
+        ttl::bump_instance(&env);
+        governance::execute_fee_update(&env)
+    }
+
+    /// Read-only: get pending fee update proposal, if any (Issue #766).
+    pub fn pending_fee_update(env: Env) -> Option<governance::FeeUpdateProposal> {
+        governance::pending_fee_update(&env)
+    }
+
+    /// Read-only: cumulative protocol fee volume collected for a given token (Issue #768).
+    pub fn accumulated_fee(env: Env, token: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AccumulatedFee(token))
+            .unwrap_or(0)
     }
 
     /// Estimate the Soroban resource cost for a given stream operation.

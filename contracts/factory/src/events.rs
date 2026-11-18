@@ -120,3 +120,19 @@ pub fn stream_contract_upgraded(env: &Env, old_wasm_hash: &BytesN<32>, new_wasm_
         (old_wasm_hash.clone(), new_wasm_hash.clone()),
     );
 }
+
+/// Emitted when a protocol fee update is proposed under timelock (Issue #766).
+pub fn fee_update_proposed(env: &Env, proposed_fee_bps: u32, eta_ledger: u32) {
+    env.events().publish(
+        (Symbol::new(env, "fee_proposed"),),
+        (proposed_fee_bps, eta_ledger),
+    );
+}
+
+/// Emitted when a timelocked protocol fee update is executed (Issue #766).
+pub fn fee_update_executed(env: &Env, old_fee_bps: u32, new_fee_bps: u32) {
+    env.events().publish(
+        (Symbol::new(env, "fee_executed"),),
+        (old_fee_bps, new_fee_bps),
+    );
+}

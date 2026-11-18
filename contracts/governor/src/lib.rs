@@ -82,6 +82,98 @@ fn refund_proposal_stake(env: &Env, proposal_id: u64, author: &Address) -> Resul
     Ok(())
 }
 
+fn cast_ballot(
+    env: Env,
+    voter: Address,
+    proposal_id: u64,
+    support: Option<bool>,
+    rationale: Option<String>,
+) -> Result<(), Error> {
+    voter.require_auth();
+    ttl::bump(&env);
+
+    if storage::has_voted(&env, proposal_id, &voter) {
+        return Err(Error::AlreadyVoted);
+    }
+
+    let mut proposal: storage::Proposal = env
+        .storage()
+        .instance()
+        .get(&DataKey::Proposal(proposal_id))
+        .ok_or(Error::ProposalNotFound)?;
+    if proposal.status != storage::ProposalStatus::Pending
+        && proposal.status != storage::ProposalStatus::Active
+    {
+        return Err(Error::ProposalNotPending);
+    }
+
+    let elapsed = env.ledger().timestamp().saturating_sub(proposal.created_at);
+    if elapsed
+        > proposal
+            .execution_window_secs
+            .saturating_add(DripGovernor::MIN_EXECUTION_DELAY)
+    {
+        return Err(Error::ProposalExpired);
+    }
+
+    let weight = match storage::get_checkpoint_weight(&env, &voter, proposal.snapshot_ledger) {
+        Some(0) => return Err(Error::InsufficientVotingWeight),
+        Some(weight) => weight,
+        None => 1,
+    };
+    match support {
+        Some(true) => proposal.for_votes = proposal.for_votes.saturating_add(weight),
+        Some(false) => proposal.against_votes = proposal.against_votes.saturating_add(weight),
+        None => {
+            storage::add_abstain_votes(&env, proposal_id, weight);
+        }
+    }
+
+    env.storage()
+        .instance()
+        .set(&DataKey::Proposal(proposal_id), &proposal);
+    storage::set_proposal_status(&env, proposal_id, storage::ProposalStatus::Active);
+
+    let previous_snapshot = storage::get_vote_tally_snapshot(&env, proposal_id);
+    let total_supply = previous_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.total_supply)
+        .unwrap_or_else(|| {
+            env.storage()
+                .instance()
+                .get(&DataKey::GovernanceSupply)
+                .unwrap_or_else(|| {
+                    env.storage()
+                        .instance()
+                        .get::<_, u32>(&DataKey::AdminCount)
+                        .unwrap_or(1) as u64
+                })
+        });
+    let snapshot = storage::VoteTallySnapshot {
+        proposal_id,
+        snapshot_ledger: proposal.snapshot_ledger,
+        for_votes: proposal.for_votes,
+        against_votes: proposal.against_votes,
+        total_supply,
+    };
+    storage::save_vote_tally_snapshot(&env, &snapshot);
+    storage::record_voter_receipt(&env, proposal_id, &voter, weight);
+
+    let min_quorum_bps = config::load(&env)?.min_quorum_bps;
+    let quorum_threshold =
+        (snapshot.total_supply as u128 * min_quorum_bps as u128 / 10_000) as u64;
+    if proposal.for_votes.saturating_add(proposal.against_votes) >= quorum_threshold {
+        refund_proposal_stake(&env, proposal_id, &proposal.author)?;
+    }
+
+    if let Some(support) = support {
+        events::vote_cast(&env, &voter, proposal_id, support, rationale);
+    } else {
+        events::vote_abstain_cast(&env, &voter, proposal_id);
+    }
+    Ok(())
+}
+
 #[contract]
 pub struct DripGovernor;
 
@@ -1059,14 +1151,12 @@ impl DripGovernor {
         cast_ballot(env, voter, proposal_id, Some(support), rationale)
     }
 
-        let min_quorum_bps = config::load(&env)?.min_quorum_bps;
-        let quorum_threshold =
-            (snapshot.total_supply as u128 * min_quorum_bps as u128 / 10_000) as u64;
-        if proposal.for_votes.saturating_add(proposal.against_votes) >= quorum_threshold {
-            refund_proposal_stake(&env, proposal_id, &proposal.author)?;
-        }
-
-        events::vote_cast(&env, &voter, proposal_id, support, rationale);
-        Ok(())
+    /// Cast an abstain ballot using the voter's checkpointed voting weight.
+    pub fn cast_abstain_vote(
+        env: Env,
+        voter: Address,
+        proposal_id: u64,
+    ) -> Result<(), Error> {
+        cast_ballot(env, voter, proposal_id, None, None)
     }
 }

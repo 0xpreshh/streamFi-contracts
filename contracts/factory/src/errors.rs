@@ -70,4 +70,10 @@ pub enum Error {
     /// Invalid factory initialization parameters (Issue #770).
     /// Indicates misconfigured factory setup (e.g., invalid fee recipient, bounds).
     InvalidFactoryConfiguration = 35,
+    /// No pending protocol fee update was found to execute (Issue #766).
+    NoPendingFeeUpdate = 36,
+    /// The timelock delay (MIN_DELAY ledgers) has not yet elapsed for the fee update (Issue #766).
+    TimelockNotMet = 37,
+    /// The proposed fee exceeds the maximum allowed basis points (10,000) (Issue #766).
+    InvalidFee = 38,
 }

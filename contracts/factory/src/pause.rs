@@ -1,46 +1,78 @@
 //! Emergency-pause flag storage and gating for `DripFactory`.
 //!
-//! The flag read/write and the "reject while halted" gate are protocol-wide
-//! policy and live in [`drip_common::pause`]; this module only keeps the
-//! crate-local call-site names (`pause::is_paused`, `pause::set_paused`,
-//! `pause::require_not_paused`) unchanged — it must not restate the gate
-//! (issue #650).
+//! Supports granular pause levels: `CreationOnly` and `FullEmergency` (Issue #767).
 
-use soroban_sdk::Env;
+use soroban_sdk::{contracttype, Env};
 
 use crate::errors::Error;
 use crate::storage::DataKey;
 
+/// Granular pause levels for creation vs withdrawal and emergency operations (Issue #767).
+#[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum PauseType {
+    Unpaused = 0,
+    CreationOnly = 1,
+    FullEmergency = 2,
+}
+
+/// Reads the current granular pause level.
+pub fn pause_level(env: &Env) -> PauseType {
+    if let Some(level) = env.storage().instance().get(&DataKey::PauseLevel) {
+        level
+    } else if drip_common::pause::is_paused(env, &DataKey::Paused) {
+        PauseType::FullEmergency
+    } else {
+        PauseType::Unpaused
+    }
+}
+
+/// Sets the granular pause level and updates the boolean flag in instance storage.
+pub fn set_pause_level(env: &Env, level: PauseType) {
+    env.storage().instance().set(&DataKey::PauseLevel, &level);
+    let is_paused = level != PauseType::Unpaused;
+    let _ = drip_common::pause::set_paused(env, &DataKey::Paused, is_paused);
+}
+
 /// Reads the emergency-pause flag.
 ///
-/// Defaults to `false` (unpaused) when the key has never been set — e.g. a
-/// factory that was initialized before this feature existed. This keeps the
-/// flag backward-compatible: an absent entry means "running normally".
+/// Defaults to `false` (unpaused) when the key has never been set.
 pub fn is_paused(env: &Env) -> bool {
-    drip_common::pause::is_paused(env, &DataKey::Paused)
+    pause_level(env) != PauseType::Unpaused
 }
 
 /// Writes the emergency-pause flag directly to instance storage.
-///
-/// # Module Boundary & Access Control
-/// This is a low-level internal storage helper. It does **not** perform caller
-/// authorization (such as checking governor gating via `require_auth`) or
-/// enforce state invariants (such as checking if the factory is already paused
-/// or unpaused).
-///
-/// Callers (e.g., [`DripFactory::pause`](crate::DripFactory::pause) and
-/// [`DripFactory::unpause`](crate::DripFactory::unpause) in `lib.rs`) are
-/// responsible for verifying caller authorization, checking current pause
-/// state transitions, updating TTL, and emitting public events.
 pub fn set_paused(env: &Env, paused: bool) {
-    let _ = drip_common::pause::set_paused(env, &DataKey::Paused, paused);
+    let level = if paused {
+        PauseType::FullEmergency
+    } else {
+        PauseType::Unpaused
+    };
+    set_pause_level(env, level);
 }
 
-/// The pause gate: `Err(ContractPaused)` while the factory is halted.
-///
-/// Delegates to [`drip_common::pause::require_not_paused`] and maps the shared
-/// error onto the factory's own `Error`, so the halt check is byte-for-byte the
-/// same gate every sibling contract runs.
+/// Rejects if stream creation is paused (either CreationOnly or FullEmergency).
+pub fn require_creation_allowed(env: &Env) -> Result<(), Error> {
+    match pause_level(env) {
+        PauseType::Unpaused => Ok(()),
+        PauseType::CreationOnly | PauseType::FullEmergency => Err(Error::ContractPaused),
+    }
+}
+
+/// The pause gate: `Err(ContractPaused)` while the factory is halted in any pause level.
 pub fn require_not_paused(env: &Env) -> Result<(), Error> {
-    drip_common::pause::require_not_paused(env, &DataKey::Paused).map_err(|_| Error::ContractPaused)
+    match pause_level(env) {
+        PauseType::Unpaused => Ok(()),
+        _ => Err(Error::ContractPaused),
+    }
+}
+
+/// Rejects if full emergency pause is active, allowing operations during CreationOnly.
+#[allow(dead_code)]
+pub fn require_withdrawals_allowed(env: &Env) -> Result<(), Error> {
+    match pause_level(env) {
+        PauseType::FullEmergency => Err(Error::ContractPaused),
+        _ => Ok(()),
+    }
 }

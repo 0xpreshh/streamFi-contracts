@@ -49,6 +49,15 @@ pub fn bump_for_remaining(env: &soroban_sdk::Env, remaining_secs: u64) {
 /// Re-exported from [`drip_common::ttl::bump_instance`] — see the module docs.
 pub use drip_common::ttl::bump_instance as bump;
 
+/// Minimum threshold and bump target for instance TTL renewals on activity (Issue #750).
+pub const LEDGER_THRESHOLD: u32 = drip_common::ttl::MIN_TTL_LEDGERS;
+pub const LEDGER_BUMP: u32 = drip_common::ttl::EXTEND_TTL_LEDGERS;
+
+/// Automatic instance TTL extension on withdraw and top_up (Issue #750).
+pub fn extend_on_activity(env: &soroban_sdk::Env) {
+    env.storage().instance().extend_ttl(LEDGER_THRESHOLD, LEDGER_BUMP);
+}
+
 /// Emergency instance TTL extension by any sender, recipient, or third-party (Issue #805).
 /// Bumps the instance storage TTL without requiring withdrawals or state mutations.
 pub fn extend_stream_ttl(env: &soroban_sdk::Env) {

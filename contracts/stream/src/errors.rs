@@ -52,4 +52,6 @@ pub enum Error {
     KeeperRewardTransferFailed = 32,
     /// Attempted to withdraw before the cliff timestamp has been reached (Issue #806).
     StreamCliffInFuture = 33,
+    /// Attempted to interact with a stream that has already completed and drained to zero balance (Issue #751).
+    StreamAlreadyCompleted = 34,
 }

@@ -3305,3 +3305,80 @@ fn test_cancel_with_reason_stored_in_persistent_storage() {
     assert_eq!(record.refund_amount, 600);
 }
 
+// ── Issues #750-#752: instance TTL extension, StreamAlreadyCompleted, StreamCliffReached ──
+
+#[test]
+fn test_top_up_and_withdraw_extend_instance_ttl() {
+    let s = Setup::new(10, 3600, false);
+    // Mint more tokens to sender for top-up
+    let tok_admin = token::StellarAssetClient::new(&s.env, &s.token.address);
+    tok_admin.mint(&s.sender, &500);
+
+    // Initial TTL
+    s.advance_secs(100);
+    let res = s.client.try_top_up(&s.sender, &100);
+    assert!(res.is_ok());
+
+    let ttl = s
+        .env
+        .as_contract(&s.client.address, || s.env.storage().instance().get_ttl());
+    assert_eq!(ttl, 200_000);
+
+    // Withdraw also extends instance TTL
+    s.advance_secs(50);
+    let w_res = s.client.try_withdraw(&50);
+    assert!(w_res.is_ok());
+    let ttl_w = s
+        .env
+        .as_contract(&s.client.address, || s.env.storage().instance().get_ttl());
+    assert_eq!(ttl_w, 200_000);
+}
+
+#[test]
+fn test_stream_already_completed_error() {
+    let s = Setup::new(10, 100, false);
+    s.advance_secs(100);
+
+    // Draining full balance completes the stream
+    s.client.withdraw(&1_000);
+    assert!(s.client.is_depleted());
+
+    // Subsequent withdrawal attempts return StreamAlreadyCompleted
+    let res = s.client.try_withdraw(&1);
+    assert_eq!(res, Err(Ok(Error::StreamAlreadyCompleted)));
+
+    // validate_withdraw also returns StreamAlreadyCompleted
+    let val_res = s.client.try_validate_withdraw(&1);
+    assert_eq!(val_res, Err(Ok(Error::StreamAlreadyCompleted)));
+
+    // Top up on a completed stream returns StreamAlreadyCompleted
+    let tok_admin = token::StellarAssetClient::new(&s.env, &s.token.address);
+    tok_admin.mint(&s.sender, &100);
+    let top_res = s.client.try_top_up(&s.sender, &100);
+    assert_eq!(top_res, Err(Ok(Error::StreamAlreadyCompleted)));
+}
+
+#[test]
+fn test_stream_cliff_reached_event_and_cliff_claimed() {
+    let s = Setup::new(10, 100, false);
+    let cliff_time = s.client.info().start_time + 40;
+    let cliff_amount = 200;
+    s.client.set_cliff(&s.sender, &cliff_time, &cliff_amount);
+
+    assert_eq!(s.client.is_cliff_claimed(), false);
+
+    // Advance past cliff
+    s.advance_secs(50);
+
+    // First withdrawal triggers cliff emission and marks cliff as claimed
+    let w = s.client.withdraw(&100);
+    assert_eq!(w, 100);
+    assert_eq!(s.client.is_cliff_claimed(), true);
+    assert_eq!(s.client.cliff_claimed(), true);
+
+    // Second withdrawal does not fail and cliff remains claimed
+    let w2 = s.client.withdraw(&50);
+    assert_eq!(w2, 50);
+    assert_eq!(s.client.is_cliff_claimed(), true);
+}
+

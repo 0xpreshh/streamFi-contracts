@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address};
+use soroban_sdk::{contracttype, Address, String};
 
 // Bit-flags packed into `StreamInfo::flags`. Kept `pub` so cross-crate
 // regression tests (e.g. `tests/audit_round_2_regression.rs::pause_resume_*`)
@@ -148,11 +148,12 @@ pub struct RateCheckpoint {
     pub at: u64,
 }
 
-/// Stream cancellation configuration (Issue #685).
+/// Stream configuration including cancelability and optional reconciliation memo (Issues #685, #803).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StreamConfig {
     pub is_cancelable: bool,
+    pub memo: Option<String>,
 }
 
 /// Operational status of a stream.

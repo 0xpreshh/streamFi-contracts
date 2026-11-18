@@ -49,6 +49,21 @@ pub fn bump_for_remaining(env: &soroban_sdk::Env, remaining_secs: u64) {
 /// Re-exported from [`drip_common::ttl::bump_instance`] — see the module docs.
 pub use drip_common::ttl::bump_instance as bump;
 
+/// Emergency instance TTL extension by any sender, recipient, or third-party (Issue #805).
+/// Bumps the instance storage TTL without requiring withdrawals or state mutations.
+pub fn extend_stream_ttl(env: &soroban_sdk::Env) {
+    if let Ok(info) = crate::state::try_load(env) {
+        let remaining = if info.end_time > 0 {
+            info.end_time.saturating_sub(env.ledger().timestamp())
+        } else {
+            0
+        };
+        bump_for_remaining(env, remaining);
+    } else {
+        bump(env);
+    }
+}
+
 /// Low-cost keeper maintenance function for stream instances.
 ///
 /// Extends the TTL of an active stream's instance storage when the remaining

@@ -2885,7 +2885,7 @@ fn test_non_cancelable_stream_rejects_cancel() {
 #[test]
 fn test_stream_auto_completion_at_exact_duration() {
     let s = Setup::new(100, 1000, false);
-    let start = s.env.ledger().timestamp();
+    let _start = s.env.ledger().timestamp();
 
     s.advance_secs(999);
     let before_end = s.client.withdrawable();
@@ -3152,4 +3152,87 @@ fn auto_settle_full_remaining_balance_on_stream_end() {
     assert_eq!(settled, 100);
     assert_eq!(s.token.balance(&s.recipient), 100);
     assert_eq!(s.token.balance(&s.client.address), 0);
+}
+
+#[test]
+fn test_enforce_minimum_cliff_amount_when_cliff_timestamp_configured() {
+    let s = Setup::new(1, 3_600, false);
+    let start_time = s.client.info().start_time;
+    let cliff_time = start_time + 1_000;
+
+    // Zero cliff amount with cliff_time > start_time is rejected with InvalidAmount (Issue #802)
+    assert_eq!(
+        s.client.try_set_cliff(&s.sender, &cliff_time, &0),
+        Err(Ok(Error::InvalidAmount))
+    );
+
+    // Negative cliff amount is rejected with InvalidAmount
+    assert_eq!(
+        s.client.try_set_cliff(&s.sender, &cliff_time, &-10),
+        Err(Ok(Error::InvalidAmount))
+    );
+
+    // Positive cliff amount succeeds
+    assert!(s.client.try_set_cliff(&s.sender, &cliff_time, &100).is_ok());
+    let cfg = s.client.cliff_config().unwrap();
+    assert_eq!(cfg.cliff_unlock_amount, 100);
+}
+
+#[test]
+fn test_stream_beneficiary_memo_field() {
+    let s = Setup::new(1, 3_600, false);
+
+    // Initially memo is None (Issue #803)
+    assert_eq!(s.client.memo(), None);
+
+    // Sender sets valid memo <= 64 bytes
+    let memo_str = String::from_str(&s.env, "DEPT-ENG-402-EMP-883");
+    s.client.set_memo(&s.sender, &Some(memo_str.clone()));
+    assert_eq!(s.client.memo(), Some(memo_str.clone()));
+
+    // Verify stream_config contains the memo
+    let cfg = s.client.stream_config().unwrap();
+    assert_eq!(cfg.memo, Some(memo_str));
+    assert_eq!(cfg.is_cancelable, true);
+
+    // Updating cancelable preserves existing memo
+    s.client.set_cancelable(&s.sender, &false);
+    assert_eq!(s.client.is_cancelable(), false);
+    assert_eq!(s.client.memo().is_some(), true);
+
+    // Updating memo preserves cancelable
+    let new_memo = String::from_str(&s.env, "ACCOUNTING-RECON-OK");
+    s.client.set_memo(&s.sender, &Some(new_memo.clone()));
+    assert_eq!(s.client.is_cancelable(), false);
+    assert_eq!(s.client.memo(), Some(new_memo));
+
+    // Memo exceeding 64 bytes is rejected with DescriptionTooLong
+    let long_memo = String::from_str(
+        &s.env,
+        "12345678901234567890123456789012345678901234567890123456789012345", // 65 bytes
+    );
+    assert_eq!(
+        s.client.try_set_memo(&s.sender, &Some(long_memo)),
+        Err(Ok(Error::DescriptionTooLong))
+    );
+
+    // Clearing memo to None succeeds
+    s.client.set_memo(&s.sender, &None);
+    assert_eq!(s.client.memo(), None);
+}
+
+#[test]
+fn test_emergency_extend_stream_ttl_unauthenticated() {
+    let s = Setup::new(1, 3_600, false);
+
+    // Any caller can extend stream instance TTL without error (Issue #805)
+    let res = s.client.try_extend_stream_ttl();
+    assert!(res.is_ok());
+
+    let res_alias = s.client.try_extend_ttl();
+    assert!(res_alias.is_ok());
+
+    // Balance and withdrawn state remain completely unchanged
+    assert_eq!(s.token.balance(&s.client.address), 3_600);
+    assert_eq!(s.client.info().withdrawn, 0);
 }

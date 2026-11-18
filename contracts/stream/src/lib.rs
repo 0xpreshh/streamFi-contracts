@@ -2087,7 +2087,8 @@ impl DripStream {
         state::assert_not_cancelled(&info)?;
         require_sender_or_operator(env, caller, &info.sender)?;
 
-        if cliff_unlock_amount < 0 {
+        // Enforce minimum cliff amount when cliff timestamp is configured (Issue #802)
+        if cliff_unlock_amount < 0 || (cliff_time > info.start_time && cliff_unlock_amount <= 0) {
             return Err(Error::InvalidAmount);
         }
         if cliff_time < info.start_time || (info.end_time > 0 && cliff_time > info.end_time) {
@@ -2173,13 +2174,18 @@ impl DripStream {
         Self::immutable_config(env)
     }
 
-    /// Configure whether the stream allows sender cancellation (Issue #685).
+    /// Configure stream settings: cancelability and beneficiary memo (Issues #685, #803).
     pub fn set_stream_config(env: Env, caller: Address, config: StreamConfig) -> Result<(), Error> {
         state::with_guard(&env, |env| {
             ttl::bump(env);
             let info = state::load(env);
             state::assert_not_cancelled(&info)?;
             require_sender_or_operator(env, &caller, &info.sender)?;
+            if let Some(ref memo) = config.memo {
+                if memo.len() > 64 {
+                    return Err(Error::DescriptionTooLong);
+                }
+            }
             env.storage()
                 .instance()
                 .set(&DataKey::StreamConfig, &config);
@@ -2189,12 +2195,24 @@ impl DripStream {
 
     /// Helper to set stream cancelability (Issue #685).
     pub fn set_cancelable(env: Env, caller: Address, is_cancelable: bool) -> Result<(), Error> {
-        Self::set_stream_config(env, caller, StreamConfig { is_cancelable })
+        let memo = Self::stream_config(env.clone()).and_then(|c| c.memo);
+        Self::set_stream_config(env, caller, StreamConfig { is_cancelable, memo })
     }
 
-    /// Read-only: get the configured stream cancellation config, if any (Issue #685).
+    /// Helper to set stream beneficiary memo for accounting reconciliations (Issue #803).
+    pub fn set_memo(env: Env, caller: Address, memo: Option<String>) -> Result<(), Error> {
+        let is_cancelable = Self::is_cancelable(env.clone());
+        Self::set_stream_config(env, caller, StreamConfig { is_cancelable, memo })
+    }
+
+    /// Read-only: get the configured stream cancellation config, if any (Issues #685, #803).
     pub fn stream_config(env: Env) -> Option<StreamConfig> {
         env.storage().instance().get(&DataKey::StreamConfig)
+    }
+
+    /// Read-only: get the configured beneficiary memo, if any (Issue #803).
+    pub fn memo(env: Env) -> Option<String> {
+        Self::stream_config(env).and_then(|c| c.memo)
     }
 
     /// Read-only: returns whether the stream allows sender cancellation (defaults to true) (Issue #685).
@@ -2208,5 +2226,17 @@ impl DripStream {
         } else {
             true
         }
+    }
+
+    /// Unauthenticated emergency instance TTL extension by any sender or recipient (Issue #805).
+    pub fn extend_stream_ttl(env: Env) -> Result<(), Error> {
+        let _info = state::try_load(&env)?;
+        ttl::extend_stream_ttl(&env);
+        Ok(())
+    }
+
+    /// Read-only / maintenance alias for `extend_stream_ttl` (Issue #805).
+    pub fn extend_ttl(env: Env) -> Result<(), Error> {
+        Self::extend_stream_ttl(env)
     }
 }

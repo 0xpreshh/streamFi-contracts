@@ -3067,3 +3067,89 @@ fn recovery_address_configuration_and_timelocked_claim() {
     assert_eq!(s.client.recovery_address(), None);
     assert_eq!(s.client.recovery_claimable_at(), None);
 }
+
+// ── Issues #806-#809: cliff error, recipient transferred event, elapsed_seconds, auto-settle ──
+
+#[test]
+fn withdrawal_before_cliff_returns_stream_cliff_in_future() {
+    let s = Setup::new(1, 3_600, false);
+    let cliff_time = s.env.ledger().timestamp() + 1_000;
+    s.client.set_cliff(&s.sender, &cliff_time, &100);
+
+    // Attempting to withdraw before cliff returns StreamCliffInFuture (Issue #806)
+    assert_eq!(
+        s.client.try_withdraw(&50),
+        Err(Ok(Error::StreamCliffInFuture))
+    );
+
+    // Advance time past the cliff
+    s.env.ledger().with_mut(|l| l.timestamp = cliff_time + 10);
+    assert!(s.client.try_withdraw(&50).is_ok());
+}
+
+#[test]
+fn recipient_transfer_emits_event_with_old_and_new_recipients() {
+    let s = Setup::new(1, 3_600, false);
+    let new_recipient = Address::generate(&s.env);
+
+    s.client.transfer_recipient(&new_recipient);
+
+    let all_events = s.env.events().all();
+    let expected_topics = (
+        soroban_sdk::Symbol::new(&s.env, "StreamRecipientTransferred"),
+        s.recipient.clone(),
+        2_u64,
+    )
+        .into_val(&s.env);
+    let matched = all_events
+        .iter()
+        .find(|(contract, topics, _)| contract == &s.client.address && topics == &expected_topics);
+    assert!(
+        matched.is_some(),
+        "StreamRecipientTransferred event with old and new recipient must be emitted"
+    );
+}
+
+#[test]
+fn elapsed_seconds_calculates_stream_age_correctly() {
+    let s = Setup::new(10, 1_000, false);
+    let info = s.env.as_contract(&s.client.address, || {
+        crate::state::load(&s.env)
+    });
+
+    // Before start
+    assert_eq!(info.elapsed_seconds(info.start_time.saturating_sub(10)), 0);
+    // At start
+    assert_eq!(info.elapsed_seconds(info.start_time), 0);
+    // Mid stream
+    assert_eq!(info.elapsed_seconds(info.start_time + 250), 250);
+    // At end
+    assert_eq!(info.elapsed_seconds(info.end_time), 1_000);
+    // Past end (capped at stream duration)
+    assert_eq!(info.elapsed_seconds(info.end_time + 500), 1_000);
+}
+
+#[test]
+fn auto_settle_full_remaining_balance_on_stream_end() {
+    let s = Setup::new(1, 100, false);
+    let now = s.env.ledger().timestamp();
+
+    // Cannot auto-settle when disabled
+    assert_eq!(s.client.try_auto_settle(), Err(Ok(Error::NotAuthorized)));
+
+    // Enable auto-settle
+    s.client.set_auto_settle(&s.recipient, &true);
+    assert!(s.client.auto_settle_enabled());
+
+    // Cannot auto-settle before stream end
+    assert_eq!(s.client.try_auto_settle(), Err(Ok(Error::InvalidTimeRange)));
+
+    // Advance to stream end
+    s.env.ledger().with_mut(|l| l.timestamp = now + 101);
+
+    // Keeper triggers auto-settle without recipient signature
+    let settled = s.client.auto_settle();
+    assert_eq!(settled, 100);
+    assert_eq!(s.token.balance(&s.recipient), 100);
+    assert_eq!(s.token.balance(&s.client.address), 0);
+}

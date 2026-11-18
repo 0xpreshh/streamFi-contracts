@@ -1,7 +1,15 @@
 use soroban_sdk::{panic_with_error, Env};
 
 use crate::storage::{DataKey, StreamInfo};
+#[allow(unused_imports)]
+pub use crate::storage::StreamState;
 use crate::Error;
+
+/// Calculate stream age in seconds from start_time up to current_time (Issue #808).
+#[allow(dead_code)]
+pub fn elapsed_seconds(info: &StreamInfo, current_time: u64) -> u64 {
+    info.elapsed_seconds(current_time)
+}
 
 /// Load the full stream state in a single storage read.
 ///

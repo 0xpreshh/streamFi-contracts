@@ -50,4 +50,6 @@ pub enum Error {
     KeeperPingTooFrequent = 31,
     /// Keeper reward transfer did not move the expected balance.
     KeeperRewardTransferFailed = 32,
+    /// Attempted to withdraw before the cliff timestamp has been reached (Issue #806).
+    StreamCliffInFuture = 33,
 }

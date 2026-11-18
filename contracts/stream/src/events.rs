@@ -197,11 +197,19 @@ pub fn clawback(env: &Env, sender: &Address, amount: i128) {
     );
 }
 
-pub fn recipient_transferred(env: &Env, old_recipient: &Address, new_recipient: &Address) {
+pub fn recipient_transferred(env: &Env, previous_recipient: &Address, new_recipient: &Address) {
     let sequence = next_sequence(env);
     env.events().publish(
-        (symbol_short!("xfer_rec"), old_recipient.clone(), sequence),
-        new_recipient.clone(),
+        (
+            Symbol::new(env, "StreamRecipientTransferred"),
+            previous_recipient.clone(),
+            sequence,
+        ),
+        (previous_recipient.clone(), new_recipient.clone()),
+    );
+    env.events().publish(
+        (symbol_short!("xfer_rec"), previous_recipient.clone(), sequence),
+        (previous_recipient.clone(), new_recipient.clone()),
     );
 }
 

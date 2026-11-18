@@ -88,6 +88,40 @@ pub fn withdrawn(
     );
 }
 
+/// Event data payload detailing withdrawal balance reconciliation (Issue #758).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VaultWithdrawal {
+    pub recipient: Address,
+    pub amount: i128,
+    pub previous_balance: i128,
+    pub new_balance: i128,
+}
+
+/// Emitted on withdrawal to publish balance before and after for off-chain accounting (Issue #758).
+///
+/// Topics: `("VaultWithdrawal", caller, recipient)`
+/// Data:   `VaultWithdrawal { recipient, amount, previous_balance, new_balance }`
+pub fn vault_withdrawal(
+    env: &Env,
+    caller: &Address,
+    recipient: &Address,
+    amount: i128,
+    previous_balance: i128,
+    new_balance: i128,
+) {
+    let payload = VaultWithdrawal {
+        recipient: recipient.clone(),
+        amount,
+        previous_balance,
+        new_balance,
+    };
+    env.events().publish(
+        (Symbol::new(env, "VaultWithdrawal"), caller.clone(), recipient.clone()),
+        payload,
+    );
+}
+
 /// Emitted by `set_limit` when the vault's maximum balance cap changes.
 ///
 /// Topics: `("limit_set", caller)` — the owner or delegated operator.

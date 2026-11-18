@@ -48,6 +48,8 @@ pub enum DataKey {
     BalanceSnapshot(Address),
     /// Index of persistent token-account and token-limit keys requiring renewal.
     TrackedVaultKeys,
+    /// Balances per user per token for faster account lookup (Issue #757).
+    DepositorTokens(Address, Address),
 }
 
 #[contracttype]
@@ -209,6 +211,24 @@ pub fn set_token_account_balance(env: &Env, token: &Address, account: &Address, 
     env.storage().persistent().set(&key, &balance);
     drip_common::ttl::bump_persistent(env, &key);
     track_vault_key(env, &key);
+}
+
+/// Returns balance of a specific token deposited by a user (Issue #757).
+pub fn get_depositor_token_balance(env: &Env, depositor: &Address, token: &Address) -> i128 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::DepositorTokens(
+            depositor.clone(),
+            token.clone(),
+        ))
+        .unwrap_or(0)
+}
+
+/// Sets balance of a specific token deposited by a user (Issue #757).
+pub fn set_depositor_token_balance(env: &Env, depositor: &Address, token: &Address, balance: i128) {
+    let key = DataKey::DepositorTokens(depositor.clone(), token.clone());
+    env.storage().persistent().set(&key, &balance);
+    drip_common::ttl::bump_persistent(env, &key);
 }
 
 pub fn get_token_max_limit(env: &Env, token: &Address) -> Option<i128> {

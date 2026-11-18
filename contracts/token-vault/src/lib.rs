@@ -12,13 +12,13 @@ use drip_stream::DripStreamClient;
 use errors::Error;
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, Vec};
 use storage::{
-    check_vault_balance, get_emergency_migration, get_max_limit, get_operator,
-    get_operator_withdraw_limit, get_owner, get_owner_proposal_ttl, get_pending_owner,
-    get_pending_owner_proposed_at, get_pending_owner_proposer, get_token,
+    check_vault_balance, get_depositor_token_balance, get_emergency_migration, get_max_limit,
+    get_operator, get_operator_withdraw_limit, get_owner, get_owner_proposal_ttl,
+    get_pending_owner, get_pending_owner_proposed_at, get_pending_owner_proposer, get_token,
     get_token_account_balance, get_token_max_limit, is_paused, is_token_approved,
     record_vault_balance, remove_emergency_migration, remove_operator, remove_pending_owner,
-    remove_pending_owner_proposed_at, remove_pending_owner_proposer, set_emergency_migration,
-    set_max_limit, set_operator, set_operator_withdraw_limit, set_owner,
+    remove_pending_owner_proposed_at, remove_pending_owner_proposer, set_depositor_token_balance,
+    set_emergency_migration, set_max_limit, set_operator, set_operator_withdraw_limit, set_owner,
     set_owner_proposal_ttl as store_owner_proposal_ttl, set_paused, set_pending_owner,
     set_pending_owner_proposed_at, set_pending_owner_proposer, set_token,
     set_token_account_balance, set_token_approved, set_token_max_limit, DataKey,
@@ -177,10 +177,15 @@ fn withdraw_payouts(
 
         let balance = vault_balance(env)?;
         if total > balance {
-            return Err(Error::LimitExceeded);
+            return Err(Error::InsufficientVaultLiquidity);
         }
 
         let tk = token_client(env)?;
+        let contract_bal = tk.balance(&env.current_contract_address());
+        if total > contract_bal {
+            return Err(Error::InsufficientVaultLiquidity);
+        }
+
         let mut expected_balance = balance;
         let by_operator = caller != &owner;
         for index in 0..payouts.len() {
@@ -194,6 +199,13 @@ fn withdraw_payouts(
                 return Err(Error::WithdrawTransferFailed);
             }
             record_vault_balance(env, &token, new_balance);
+
+            let cur_dep_bal = get_depositor_token_balance(env, caller, &token);
+            if cur_dep_bal >= amount {
+                set_depositor_token_balance(env, caller, &token, cur_dep_bal - amount);
+            }
+            ttl::extend_balance_ttl(env, &token, caller);
+
             events::withdrawn(env, caller, &to, amount, new_balance, by_operator);
         }
 
@@ -291,6 +303,11 @@ impl TokenVault {
             if let Some(new_acc_bal) = cur_acc_bal.checked_add(amount) {
                 set_token_account_balance(&env, &default_token, &from, new_acc_bal);
             }
+            let cur_dep_bal = get_depositor_token_balance(&env, &from, &default_token);
+            if let Some(new_dep_bal) = cur_dep_bal.checked_add(amount) {
+                set_depositor_token_balance(&env, &from, &default_token, new_dep_bal);
+            }
+            ttl::extend_balance_ttl(&env, &default_token, &from);
 
             record_vault_balance(&env, &default_token, new_balance);
             bump_instance(&env);
@@ -372,6 +389,16 @@ impl TokenVault {
                 tk.transfer(&deposit.from, &contract_addr, &deposit.amount);
                 let current_balance = tk.balance(&contract_addr);
                 events::deposited(&env, &deposit.from, deposit.amount, current_balance);
+
+                let cur_acc_bal = get_token_account_balance(&env, &default_token, &deposit.from);
+                if let Some(new_acc_bal) = cur_acc_bal.checked_add(deposit.amount) {
+                    set_token_account_balance(&env, &default_token, &deposit.from, new_acc_bal);
+                }
+                let cur_dep_bal = get_depositor_token_balance(&env, &deposit.from, &default_token);
+                if let Some(new_dep_bal) = cur_dep_bal.checked_add(deposit.amount) {
+                    set_depositor_token_balance(&env, &deposit.from, &default_token, new_dep_bal);
+                }
+                ttl::extend_balance_ttl(&env, &default_token, &deposit.from);
             }
 
             let final_balance = tk.balance(&contract_addr);
@@ -857,6 +884,13 @@ impl TokenVault {
                 .ok_or(Error::ArithmeticOverflow)?;
             set_token_account_balance(&env, &token, &from, new_acc_balance);
 
+            let cur_dep_bal = get_depositor_token_balance(&env, &from, &token);
+            let new_dep_bal = cur_dep_bal
+                .checked_add(amount)
+                .ok_or(Error::ArithmeticOverflow)?;
+            set_depositor_token_balance(&env, &from, &token, new_dep_bal);
+            ttl::extend_balance_ttl(&env, &token, &from);
+
             bump_instance(&env);
             events::deposited(
                 &env,
@@ -893,7 +927,7 @@ impl TokenVault {
             let tk = token::Client::new(&env, &token);
             let vault_bal = tk.balance(&env.current_contract_address());
             if amount > vault_bal {
-                return Err(Error::LimitExceeded);
+                return Err(Error::InsufficientVaultLiquidity);
             }
 
             let current_acc_balance = get_token_account_balance(&env, &token, &caller);
@@ -907,6 +941,12 @@ impl TokenVault {
                 set_token_account_balance(&env, &token, &caller, current_acc_balance - amount);
             }
 
+            let current_dep_bal = get_depositor_token_balance(&env, &caller, &token);
+            if current_dep_bal >= amount {
+                set_depositor_token_balance(&env, &caller, &token, current_dep_bal - amount);
+            }
+            ttl::extend_balance_ttl(&env, &token, &caller);
+
             let new_vault_bal = tk.balance(&env.current_contract_address());
             if new_vault_bal
                 != vault_bal
@@ -918,10 +958,21 @@ impl TokenVault {
             record_vault_balance(&env, &token, new_vault_bal);
             let by_operator = caller != owner;
             events::withdrawn(&env, &caller, &to, amount, new_vault_bal, by_operator);
+            events::vault_withdrawal(&env, &caller, &to, amount, vault_bal, new_vault_bal);
 
             bump_instance(&env);
             Ok(())
         })
+    }
+
+    /// Read-only: balance of a specific token deposited by a user into the vault (Issue #757).
+    pub fn get_depositor_token_balance(env: Env, depositor: Address, token: Address) -> i128 {
+        get_depositor_token_balance(&env, &depositor, &token)
+    }
+
+    /// Extends storage TTL for an account's token balance (Issue #759).
+    pub fn extend_balance_ttl(env: Env, token: Address, account: Address) {
+        ttl::extend_balance_ttl(&env, &token, &account);
     }
 
     /// Read-only: balance of a specific token held for an account in persistent storage (Issue #724).

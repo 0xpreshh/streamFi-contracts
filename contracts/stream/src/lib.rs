@@ -333,6 +333,14 @@ impl DripStream {
             }
         }
 
+        let cliff_opt: Option<CliffConfig> = env.storage().instance().get(&DataKey::CliffConfig);
+        if let Some(cliff) = cliff_opt {
+            let now = env.ledger().timestamp();
+            if now < cliff.cliff_time {
+                return Err(Error::StreamCliffInFuture);
+            }
+        }
+
         // `available` is the recipient's accrued-but-unwithdrawn entitlement
         // (rate * elapsed - withdrawn). If nothing has accrued yet there is
         // genuinely nothing to send.
@@ -1273,6 +1281,14 @@ impl DripStream {
             }
         }
 
+        let cliff_opt: Option<CliffConfig> = env.storage().instance().get(&DataKey::CliffConfig);
+        if let Some(cliff) = cliff_opt {
+            let now = env.ledger().timestamp();
+            if now < cliff.cliff_time {
+                return Err(Error::StreamCliffInFuture);
+            }
+        }
+
         let available = math::withdrawable(&env, &info)?;
         if available == 0 {
             return Err(Error::NothingToWithdraw);
@@ -1576,6 +1592,115 @@ impl DripStream {
     /// Read-only: get the recipient's configured payout forwarding address.
     pub fn auto_forward_address(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::AutoForwardAddress)
+    }
+
+    /// Configure auto-settle flag for the stream (Issue #809).
+    ///
+    /// Allows the recipient or sender to enable automatic settlement upon stream end.
+    pub fn set_auto_settle(env: Env, caller: Address, enabled: bool) -> Result<(), Error> {
+        state::with_guard(&env, |env| {
+            ttl::bump(env);
+            let info = state::load(env);
+            state::assert_not_cancelled(&info)?;
+            if caller != info.sender && caller != info.recipient {
+                return Err(Error::NotAuthorized);
+            }
+            caller.require_auth();
+            env.storage().instance().set(&DataKey::AutoSettle, &enabled);
+            Ok(())
+        })
+    }
+
+    /// Read-only: check whether auto-settle is enabled for this stream (Issue #809).
+    pub fn auto_settle_enabled(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::AutoSettle)
+            .unwrap_or(false)
+    }
+
+    /// Automatically withdraw full remaining balance on stream end (Issue #809).
+    ///
+    /// When auto_settle is enabled and the stream has reached its end time,
+    /// keepers or senders can trigger the final payout without requiring the
+    /// recipient's signature.
+    pub fn auto_settle(env: Env) -> Result<i128, Error> {
+        state::with_guard(&env, |env| {
+            ttl::bump(env);
+            let info = state::load(env);
+            state::assert_not_cancelled(&info)?;
+
+            let is_enabled: bool = env
+                .storage()
+                .instance()
+                .get(&DataKey::AutoSettle)
+                .unwrap_or(false);
+            if !is_enabled {
+                return Err(Error::NotAuthorized);
+            }
+
+            let now = env.ledger().timestamp();
+            if info.end_time == 0 || now < info.end_time {
+                return Err(Error::InvalidTimeRange);
+            }
+
+            let available = math::withdrawable(env, &info)?;
+            if available == 0 {
+                return Err(Error::NothingToWithdraw);
+            }
+
+            let tk = token::Client::new(env, &info.token);
+            let contract_addr = env.current_contract_address();
+            let payout_recipient = auto_forward_address(env, &info.recipient);
+            let balance = tk.balance(&contract_addr);
+            let to_send = available.min(balance);
+            if to_send == 0 {
+                return Err(Error::StreamUnderfunded);
+            }
+
+            let new_withdrawn = info
+                .withdrawn
+                .checked_add(to_send)
+                .ok_or(Error::ArithmeticOverflow)?;
+
+            let mut updated = info.clone();
+            updated.withdrawn = new_withdrawn;
+            state::save(env, &updated);
+
+            let split_opt: Option<SplitConfig> =
+                env.storage().instance().get(&DataKey::SplitConfig);
+            if let Some(split) = split_opt {
+                let secondary_amount =
+                    math::mul_div(env, to_send, split.split_bps as u128, 10_000)?;
+                let primary_amount = to_send
+                    .checked_sub(secondary_amount)
+                    .ok_or(Error::ArithmeticOverflow)?;
+                if primary_amount > 0 {
+                    tk.transfer(&contract_addr, &payout_recipient, &primary_amount);
+                }
+                if secondary_amount > 0 {
+                    tk.transfer(
+                        &contract_addr,
+                        &split.secondary_recipient,
+                        &secondary_amount,
+                    );
+                }
+            } else {
+                tk.transfer(&contract_addr, &payout_recipient, &to_send);
+            }
+
+            let remaining = balance.saturating_sub(to_send);
+            events::withdrawn(env, &info.recipient, to_send, new_withdrawn, remaining);
+
+            if remaining == 0 && !env.storage().instance().has(&DataKey::StreamCompleted) {
+                env.storage()
+                    .instance()
+                    .set(&DataKey::StreamCompleted, &true);
+                events::stream_completed(env, &info.recipient, new_withdrawn);
+            }
+
+            Ok(to_send)
+        })
     }
 
     /// Read-only: get the total amount deposited into the stream.

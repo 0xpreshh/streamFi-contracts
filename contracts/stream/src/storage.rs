@@ -96,6 +96,8 @@ pub enum DataKey {
     RecoveryAddress,
     /// Timelock timestamp after which a recovery claim may be executed (Issue #810).
     RecoveryClaimableAt,
+    /// Optional flag allowing keepers or senders to auto-settle the stream upon stream end (Issue #809).
+    AutoSettle,
 }
 
 /// Immutable stream configuration stored in instance storage for cheaper reads (Issue #702).
@@ -224,4 +226,20 @@ impl StreamInfo {
     pub fn mark_regulated_asset(&mut self) {
         self.flags |= FLAG_REGULATED_ASSET;
     }
+
+    /// Calculate stream age in seconds from start_time up to current_time (Issue #808).
+    pub fn elapsed_seconds(&self, current_time: u64) -> u64 {
+        if current_time <= self.start_time {
+            return 0;
+        }
+        let effective_end = if self.end_time > 0 {
+            current_time.min(self.end_time)
+        } else {
+            current_time
+        };
+        effective_end.saturating_sub(self.start_time)
+    }
 }
+
+/// Alias for `StreamInfo` representing persisted stream state (Issue #808).
+pub type StreamState = StreamInfo;

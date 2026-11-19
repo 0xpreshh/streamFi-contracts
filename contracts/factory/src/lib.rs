@@ -108,6 +108,7 @@ impl DripFactory {
         end_time: u64,
         clawback: bool,
         description: Option<soroban_sdk::String>,
+        metadata_uri: Option<soroban_sdk::String>,
     ) -> Result<u64, Error> {
         // ── Auth ─────────────────────────────────────────────────────────
         sender.require_auth();
@@ -137,6 +138,12 @@ impl DripFactory {
             }
         }
 
+        if let Some(ref uri) = metadata_uri {
+            if uri.len() > drip_stream::MAX_METADATA_URI_LEN {
+                return Err(Error::MetadataUriTooLong);
+            }
+        }
+
         // ── Governor-controlled bounds ──────────────────────────────────────
         let governor: Address = env
             .storage()
@@ -157,7 +164,10 @@ impl DripFactory {
             start_time,
             end_time,
             clawback,
-            description,
+            drip_stream::StreamInitMetadata {
+                description,
+                metadata_uri,
+            },
         )
     }
 
@@ -236,7 +246,7 @@ impl DripFactory {
         start_time: u64,
         end_time: u64,
         clawback: bool,
-        description: Option<soroban_sdk::String>,
+        metadata: drip_stream::StreamInitMetadata,
     ) -> Result<u64, Error> {
         // ── Governor-controlled bounds ──────────────────────────────────────
         governance::enforce_bounds(config, rate_per_sec, start_time, end_time, now)?;
@@ -339,7 +349,7 @@ impl DripFactory {
             clawback.into_val(&env),
             config.force_cancel_pause_secs.into_val(&env),
             false.into_val(&env), // is_regulated_asset
-            description.into_val(&env),
+            metadata.into_val(&env),
         ];
 
         let stream_addr = match deploy::deploy_stream(&env, &wasm_hash, stream_id, init_args) {
@@ -490,7 +500,10 @@ impl DripFactory {
                 cfg.start_time,
                 cfg.end_time,
                 cfg.clawback,
-                None,
+                drip_stream::StreamInitMetadata {
+                    description: None,
+                    metadata_uri: None,
+                },
             )?;
             let addr: Address = env
                 .storage()
@@ -559,7 +572,10 @@ impl DripFactory {
                 request.start_time,
                 request.end_time,
                 clawback,
-                None,
+                drip_stream::StreamInitMetadata {
+                    description: None,
+                    metadata_uri: None,
+                },
             )?;
             stream_ids.push_back(stream_id);
         }

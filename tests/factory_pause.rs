@@ -173,6 +173,7 @@ fn create_stream_is_rejected_while_paused() {
         &(now + 7_200),
         &false,
         &None,
+        &None,
     );
     assert_eq!(result, Err(Ok(Error::ContractPaused)));
 }
@@ -201,6 +202,7 @@ fn create_stream_works_again_after_unpause() {
         &now,
         &(now + 7_200),
         &false,
+        &None,
         &None,
     );
     assert_ne!(result, Err(Ok(Error::ContractPaused)));

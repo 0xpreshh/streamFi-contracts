@@ -54,4 +54,6 @@ pub enum Error {
     StreamCliffInFuture = 33,
     /// Attempted to interact with a stream that has already completed and drained to zero balance (Issue #751).
     StreamAlreadyCompleted = 34,
+    /// The optional creation-time metadata URI exceeds 128 bytes (Issue #923).
+    MetadataUriTooLong = 35,
 }

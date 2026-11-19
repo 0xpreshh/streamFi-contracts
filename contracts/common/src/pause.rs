@@ -86,8 +86,8 @@ pub fn is_paused<K: StorageKey>(env: &Env, paused_key: &K) -> bool {
         if !state.paused {
             return false;
         }
+        let now = env.ledger().timestamp();
         if let Some(max_dur) = state.max_duration {
-            let now = env.ledger().timestamp();
             if now >= state.paused_at.saturating_add(max_dur) {
                 let mut expired = state;
                 expired.paused = false;
@@ -95,6 +95,20 @@ pub fn is_paused<K: StorageKey>(env: &Env, paused_key: &K) -> bool {
                 expired.max_duration = None;
                 expired.unpaused_at = Some(now);
                 storage.set(paused_key, &expired);
+                return false;
+            }
+        }
+        // A cooldown-based unpause stays paused until the scheduled timestamp.
+        // `unpause_cooldown` distinguishes this scheduled state from the
+        // anti-rapid-toggle case (where `paused` is already false).
+        if let (Some(_), Some(unpause_at)) = (state.unpause_cooldown, state.unpaused_at) {
+            if now >= unpause_at {
+                let mut resumed = state;
+                resumed.paused = false;
+                resumed.paused_at = 0;
+                resumed.max_duration = None;
+                resumed.unpaused_at = Some(now);
+                storage.set(paused_key, &resumed);
                 return false;
             }
         }
@@ -165,6 +179,50 @@ pub fn set_paused_with_cooldown<K: StorageKey>(
         },
         unpause_cooldown,
     };
+    env.storage().instance().set(paused_key, &state);
+    Ok(())
+}
+
+/// Schedules an unpause after `cooldown_seconds`, keeping the contract halted
+/// for the duration of the cooldown.
+///
+/// This is the gradual-unpause path: instead of restoring every entry point at
+/// once, an operator can request an unpause and let the clock run out while the
+/// gate still rejects state-mutating calls. The scheduled timestamp is written
+/// into the existing pause state; [`is_paused`] / [`require_not_paused`] clear
+/// it automatically once the cooldown has elapsed, so no separate keeper call
+/// is needed.
+///
+/// A zero cooldown unpauses immediately (the same result as
+/// [`set_paused`] with `false`). Calling this while the contract is already
+/// running is a no-op. The caller still owns authorization and event emission.
+pub fn unpause_with_cooldown<K: StorageKey>(
+    env: &Env,
+    paused_key: &K,
+    cooldown_seconds: u64,
+) -> Result<(), PausedError> {
+    let Some(mut state) = get_pause_state(env, paused_key) else {
+        return Ok(());
+    };
+    if !state.paused {
+        return Ok(());
+    }
+
+    let now = env.ledger().timestamp();
+    if cooldown_seconds == 0 {
+        state.paused = false;
+        state.paused_at = 0;
+        state.max_duration = None;
+        state.unpaused_at = Some(now);
+        state.unpause_cooldown = None;
+    } else {
+        // Keep `paused = true` and record the target timestamp. `is_paused`
+        // treats this pair as a pending unpause rather than an anti-rapid-
+        // toggle marker (which is only stored while `paused` is false).
+        state.unpaused_at = Some(now.saturating_add(cooldown_seconds));
+        state.unpause_cooldown = Some(cooldown_seconds);
+    }
+
     env.storage().instance().set(paused_key, &state);
     Ok(())
 }
@@ -430,6 +488,55 @@ mod tests {
             env.ledger().set_timestamp(2301);
             assert!(set_paused_with_cooldown(&env, &PAUSED, true, None, Some(cooldown)).is_ok());
             assert!(is_paused(&env, &PAUSED));
+        });
+    }
+
+    #[test]
+    fn unpause_with_cooldown_keeps_the_gate_closed_until_the_timestamp() {
+        let env = Env::default();
+        let cooldown = 300;
+
+        in_contract(&env, || {
+            env.ledger().set_timestamp(1_000);
+            set_paused(&env, &PAUSED, true).ok();
+
+            assert!(unpause_with_cooldown(&env, &PAUSED, cooldown).is_ok());
+            assert!(is_paused(&env, &PAUSED));
+            assert_eq!(
+                require_not_paused(&env, &PAUSED),
+                Err(PausedError::ContractPaused)
+            );
+
+            env.ledger().set_timestamp(1_299);
+            assert!(is_paused(&env, &PAUSED));
+
+            env.ledger().set_timestamp(1_300);
+            assert!(!is_paused(&env, &PAUSED));
+            assert_eq!(require_not_paused(&env, &PAUSED), Ok(()));
+        });
+    }
+
+    #[test]
+    fn zero_cooldown_unpauses_immediately() {
+        let env = Env::default();
+
+        in_contract(&env, || {
+            env.ledger().set_timestamp(1_000);
+            set_paused(&env, &PAUSED, true).ok();
+
+            assert!(unpause_with_cooldown(&env, &PAUSED, 0).is_ok());
+            assert!(!is_paused(&env, &PAUSED));
+            assert_eq!(require_not_paused(&env, &PAUSED), Ok(()));
+        });
+    }
+
+    #[test]
+    fn unpause_with_cooldown_is_a_no_op_when_running() {
+        let env = Env::default();
+
+        in_contract(&env, || {
+            assert!(unpause_with_cooldown(&env, &PAUSED, 300).is_ok());
+            assert!(!is_paused(&env, &PAUSED));
         });
     }
 

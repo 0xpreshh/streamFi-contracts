@@ -32,6 +32,21 @@ pub const MAX_STREAM_DURATION: u64 = 3_155_760_000;
 /// Maximum byte length of the optional human-readable description (#845).
 pub const MAX_DESCRIPTION_LEN: u32 = 128;
 
+/// Maximum byte length of the optional invoice/reference metadata URI (#923).
+pub const MAX_METADATA_URI_LEN: u32 = 128;
+
+/// Optional descriptive metadata supplied at stream creation (Issue #923).
+///
+/// A struct is used instead of a second optional argument because Soroban
+/// entry points are capped at ten parameters, and `initialize` is already at
+/// the limit.
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamInitMetadata {
+    pub description: Option<String>,
+    pub metadata_uri: Option<String>,
+}
+
 #[contract]
 pub struct DripStream;
 
@@ -141,6 +156,74 @@ impl DripStream {
         is_regulated_asset: bool,
         description: Option<String>,
     ) {
+        Self::initialize_impl(
+            env,
+            sender,
+            recipient,
+            token,
+            rate_per_second,
+            start_time,
+            end_time,
+            clawback_enabled,
+            force_cancel_pause_secs,
+            is_regulated_asset,
+            description,
+            None,
+        );
+    }
+
+    /// Creates a stream and stores an optional invoice/reference metadata URI
+    /// (Issue #923).
+    ///
+    /// The URI is written to persistent storage under `DataKey::MetadataUri`
+    /// and limited to 128 bytes so a caller cannot inflate the stream's
+    /// footprint without bound. `initialize` remains available for direct
+    /// deployments that do not need metadata.
+    #[allow(clippy::too_many_arguments)]
+    pub fn initialize_with_metadata(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        token: Address,
+        rate_per_second: i128,
+        start_time: u64,
+        end_time: u64,
+        clawback_enabled: bool,
+        force_cancel_pause_secs: u64,
+        is_regulated_asset: bool,
+        metadata: StreamInitMetadata,
+    ) {
+        Self::initialize_impl(
+            env,
+            sender,
+            recipient,
+            token,
+            rate_per_second,
+            start_time,
+            end_time,
+            clawback_enabled,
+            force_cancel_pause_secs,
+            is_regulated_asset,
+            metadata.description,
+            metadata.metadata_uri,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn initialize_impl(
+        env: Env,
+        sender: Address,
+        recipient: Address,
+        token: Address,
+        rate_per_second: i128,
+        start_time: u64,
+        end_time: u64,
+        clawback_enabled: bool,
+        force_cancel_pause_secs: u64,
+        is_regulated_asset: bool,
+        description: Option<String>,
+        metadata_uri: Option<String>,
+    ) {
         if env.storage().instance().has(&DataKey::Config) {
             panic_with_error!(&env, Error::AlreadyInitialized);
         }
@@ -207,6 +290,12 @@ impl DripStream {
         if let Some(ref desc) = description {
             if desc.len() > MAX_DESCRIPTION_LEN {
                 panic_with_error!(&env, Error::DescriptionTooLong);
+            }
+        }
+
+        if let Some(ref uri) = metadata_uri {
+            if uri.len() > MAX_METADATA_URI_LEN {
+                panic_with_error!(&env, Error::MetadataUriTooLong);
             }
         }
 
@@ -289,6 +378,13 @@ impl DripStream {
                 cumulative_fees: 0,
             },
         );
+
+        if let Some(uri) = metadata_uri {
+            env.storage()
+                .persistent()
+                .set(&DataKey::MetadataUri, &uri);
+            drip_common::ttl::bump_persistent(&env, &DataKey::MetadataUri);
+        }
 
         events::created(
             &env,
@@ -2025,6 +2121,11 @@ impl DripStream {
     /// Read-only: the optional milestone metadata URI, if set (Issue #748).
     pub fn milestone_metadata_uri(env: Env) -> Option<String> {
         env.storage().instance().get(&DataKey::MilestoneMetadataUri)
+    }
+
+    /// Read-only: the optional creation-time stream metadata URI (Issue #923).
+    pub fn metadata_uri(env: Env) -> Option<String> {
+        env.storage().persistent().get(&DataKey::MetadataUri)
     }
 
     /// Read-only: total tokens streamed so far (regardless of withdrawals).

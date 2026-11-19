@@ -379,6 +379,37 @@ mod tests {
     }
 
     #[test]
+    fn fixed_point_withdrawal_without_cumulative_precision_loss() {
+        let env = Env::default();
+        // 100,000 U256 operations exceed the default per-invocation budget.
+        env.budget().reset_unlimited();
+        // 2^53 + 1 is the first integer a f64 cannot represent exactly.
+        let rate: i128 = 9_007_199_254_740_993;
+        let steps: u64 = 100_000;
+
+        let mut withdrawn_fixed: i128 = 0;
+        let mut previous_fixed: i128 = 0;
+        let mut previous_float: f64 = 0.0;
+
+        for step in 1..=steps {
+            let vested_fixed = mul_div(&env, rate, step as u128, 1).unwrap();
+            let vested_float = rate as f64 * step as f64;
+
+            withdrawn_fixed += vested_fixed - previous_fixed;
+
+            previous_fixed = vested_fixed;
+            previous_float = vested_float;
+        }
+
+        // The u128 fixed-point path is exact: every withdrawal is the exact
+        // delta, so the cumulative total equals `rate * steps` with no drift.
+        assert_eq!(withdrawn_fixed, rate * steps as i128);
+        // The floating-point approximation cannot represent the final vested
+        // amount exactly, demonstrating why the contract must not use it.
+        assert_ne!(previous_fixed as f64, previous_float);
+    }
+
+    #[test]
     fn test_calculate_decay_stream_extreme_elapsed_and_amounts() {
         let initial = 1_000_000_000_000_000_000_i128;
         let half_life = 100;

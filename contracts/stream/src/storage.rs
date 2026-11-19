@@ -86,6 +86,8 @@ pub enum DataKey {
     InvoiceMetadataUri,
     /// Optional metadata URI for stream milestones (Issue #748).
     MilestoneMetadataUri,
+    /// Optional invoice/reference metadata URI set at creation (Issue #923).
+    MetadataUri,
     /// Separately funded token pool used to reimburse stream keepers (#840).
     KeeperRewardPool,
     /// Last ledger on which a keeper reward was paid.

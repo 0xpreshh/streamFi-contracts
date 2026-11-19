@@ -76,4 +76,6 @@ pub enum Error {
     TimelockNotMet = 37,
     /// The proposed fee exceeds the maximum allowed basis points (10,000) (Issue #766).
     InvalidFee = 38,
+    /// The optional stream metadata URI exceeds 128 bytes (Issue #923).
+    MetadataUriTooLong = 39,
 }

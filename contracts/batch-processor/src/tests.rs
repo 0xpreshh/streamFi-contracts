@@ -140,6 +140,53 @@ fn process_batch_transfers_each_amount_and_returns_total() {
 }
 
 #[test]
+fn process_batch_with_allowance_pulls_and_fans_out_using_the_approved_allowance() {
+    let s = Setup::new();
+    let recipients = s.recipients(3);
+    let amounts = s.amounts(&[100, 200, 300]);
+    let expiry = s.env.ledger().sequence() + 1_000;
+    s.token
+        .approve(&s.funder, &s.client.address, &600, &expiry);
+
+    let total = s
+        .client
+        .process_batch_with_allowance(&s.funder, &s.token_addr, &recipients, &amounts);
+
+    assert_eq!(total, 600);
+    assert_eq!(s.token.balance(&recipients.get(0).unwrap()), 100);
+    assert_eq!(s.token.balance(&recipients.get(1).unwrap()), 200);
+    assert_eq!(s.token.balance(&recipients.get(2).unwrap()), 300);
+    assert_eq!(s.token.balance(&s.client.address), 0);
+    assert_eq!(s.token.balance(&s.funder), 1_000_000 - 600);
+    // The inbound `transfer_from` consumed the aggregate allowance.
+    assert_eq!(s.token.allowance(&s.funder, &s.client.address), 0);
+}
+
+#[test]
+fn process_batch_with_allowance_rejects_insufficient_allowance_before_transfers() {
+    let s = Setup::new();
+    let recipients = s.recipients(2);
+    let amounts = s.amounts(&[100, 200]);
+    let expiry = s.env.ledger().sequence() + 1_000;
+    s.token
+        .approve(&s.funder, &s.client.address, &299, &expiry);
+
+    let result = s.client.try_process_batch_with_allowance(
+        &s.funder,
+        &s.token_addr,
+        &recipients,
+        &amounts,
+    );
+
+    assert_eq!(result, Err(Ok(Error::InsufficientAllowance)));
+    assert_eq!(s.token.balance(&s.funder), 1_000_000);
+    assert_eq!(s.token.balance(&s.client.address), 0);
+    assert_eq!(s.token.balance(&recipients.get(0).unwrap()), 0);
+    assert_eq!(s.token.balance(&recipients.get(1).unwrap()), 0);
+    assert_eq!(s.processor_events().len(), 0);
+}
+
+#[test]
 fn process_batch_accepts_a_batch_of_exactly_max_size() {
     let s = Setup::new();
     let recipients = s.recipients(MAX_BATCH_SIZE);
@@ -170,8 +217,8 @@ fn max_batch_size_reports_the_enforced_cap() {
 #[test]
 fn version_reports_the_current_behaviour_version() {
     let s = Setup::new();
-    // v3 adds a caller-bounded partial batch entry point.
-    assert_eq!(s.client.version(), 3);
+    // v4 adds the allowance-funded batch entry point.
+    assert_eq!(s.client.version(), 4);
 }
 
 #[test]

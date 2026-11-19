@@ -17,6 +17,12 @@ pub fn is_depleted(state: &StreamState) -> bool {
     state.is_depleted()
 }
 
+/// True when the stream's schedule has completed by `current_time` (Issue #927).
+#[allow(dead_code)]
+pub fn is_fully_vested(info: &StreamInfo, current_time: u64) -> bool {
+    info.is_fully_vested(current_time)
+}
+
 /// Load the full stream state in a single storage read.
 ///
 /// Reads the consolidated `Config` key. All streams are now written with

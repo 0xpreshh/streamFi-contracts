@@ -247,6 +247,16 @@ impl StreamInfo {
         }
     }
 
+    /// True once a bounded stream's schedule has completed at `current_time` (Issue #927).
+    ///
+    /// This is a time check only: it says the stream has reached `end_time`,
+    /// not that every token has been withdrawn. Use [`Self::is_depleted`] for
+    /// the funding question. Open-ended streams (`end_time == 0`) have no
+    /// scheduled completion and are never fully vested.
+    pub fn is_fully_vested(&self, current_time: u64) -> bool {
+        self.end_time > 0 && current_time >= self.end_time
+    }
+
     /// Calculate stream age in seconds from start_time up to current_time (Issue #808).
     pub fn elapsed_seconds(&self, current_time: u64) -> u64 {
         if current_time <= self.start_time {

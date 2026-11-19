@@ -444,7 +444,7 @@ impl DripStream {
         // genuinely nothing to send.
         let available = math::withdrawable(env, &info)?;
         if available == 0 {
-            if info.end_time > 0 && env.ledger().timestamp() >= info.end_time && info.is_depleted() {
+            if info.is_fully_vested(env.ledger().timestamp()) && info.is_depleted() {
                 return Err(Error::StreamAlreadyCompleted);
             }
             return Err(Error::NothingToWithdraw);
@@ -869,7 +869,7 @@ impl DripStream {
         require_sender_or_operator(env, caller, &info.sender)?;
 
         let now = env.ledger().timestamp();
-        if info.end_time > 0 && now >= info.end_time {
+        if info.is_fully_vested(now) {
             return Err(Error::StreamEnded);
         }
 
@@ -972,7 +972,7 @@ impl DripStream {
         // streamable. Applying the check there would contradict the function's
         // job.
         let now = env.ledger().timestamp();
-        if info.end_time > 0 && now >= info.end_time {
+        if info.is_fully_vested(now) {
             if info.is_depleted() || env.storage().instance().has(&DataKey::StreamCompleted) {
                 return Err(Error::StreamAlreadyCompleted);
             }
@@ -1461,7 +1461,7 @@ impl DripStream {
 
         let available = math::withdrawable(&env, &info)?;
         if available == 0 {
-            if info.end_time > 0 && env.ledger().timestamp() >= info.end_time && info.is_depleted() {
+            if info.is_fully_vested(env.ledger().timestamp()) && info.is_depleted() {
                 return Err(Error::StreamAlreadyCompleted);
             }
             return Err(Error::NothingToWithdraw);
@@ -1641,7 +1641,7 @@ impl DripStream {
         // entitlement is fully fixed and the recipient transfer would emit a
         // misleading event without changing future withdrawals.
         let now = env.ledger().timestamp();
-        if info.end_time > 0 && now >= info.end_time {
+        if info.is_fully_vested(now) {
             return Err(Error::StreamEnded);
         }
 
@@ -2215,7 +2215,7 @@ impl DripStream {
             StreamStatus::Paused
         } else if now < info.start_time {
             StreamStatus::Pending
-        } else if info.end_time > 0 && now >= info.end_time {
+        } else if info.is_fully_vested(now) {
             StreamStatus::Completed
         } else {
             StreamStatus::Active

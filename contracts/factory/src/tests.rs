@@ -46,6 +46,42 @@ impl Setup {
 }
 
 #[test]
+fn stream_count_uses_the_temporary_cache_and_reseeds_after_expiry() {
+    let s = Setup::new();
+    let contract_id = s.client.address.clone();
+
+    assert_eq!(s.client.stream_count(), 0);
+
+    s.env.as_contract(&contract_id, || {
+        assert_eq!(
+            s.env
+                .storage()
+                .temporary()
+                .get::<_, u64>(&DataKey::StreamCountCache),
+            Some(0)
+        );
+        // Simulate temporary expiry while the durable counter moves on.
+        s.env
+            .storage()
+            .temporary()
+            .remove(&DataKey::StreamCountCache);
+        s.env.storage().instance().set(&DataKey::StreamCount, &9u64);
+    });
+
+    assert_eq!(s.client.stream_count(), 9);
+
+    s.env.as_contract(&contract_id, || {
+        assert_eq!(
+            s.env
+                .storage()
+                .temporary()
+                .get::<_, u64>(&DataKey::StreamCountCache),
+            Some(9)
+        );
+    });
+}
+
+#[test]
 fn pause_then_unpause_flips_state() {
     let s = Setup::new();
     assert!(!s.client.is_paused());

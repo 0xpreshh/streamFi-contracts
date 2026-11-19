@@ -325,4 +325,9 @@ pub enum DataKey {
     PendingFeeUpdate,
     /// **Instance storage.** Active protocol fee in basis points when set via timelocked execution (Issue #766).
     ProtocolFeeBps,
+    /// **Temporary storage.** Cached copy of `DataKey::StreamCount` for cheap
+    /// dashboard reads (Issue #926). Written on creation and refreshed with a
+    /// TTL bump on every read; falls back to the durable instance counter when
+    /// the temporary entry has expired.
+    StreamCountCache,
 }

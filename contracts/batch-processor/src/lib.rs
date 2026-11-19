@@ -40,7 +40,9 @@ pub const MAX_BATCH_LIMIT: u32 = MAX_BATCH_SIZE;
 ///   `preview_batch` was added.
 /// - `3` — added `process_batch_with_limit`, which lets callers bound work
 ///   deterministically and reports the processed prefix and remaining items.
-const VERSION: u32 = 3;
+/// - `4` — added `process_batch_with_allowance`, which pre-flights the
+///   aggregate allowance before pulling funds via `transfer_from` (issue #925).
+const VERSION: u32 = 4;
 
 /// Instance-storage key space.
 ///
@@ -93,6 +95,9 @@ pub enum Error {
     ReentrancyForbidden = 10,
     /// The requested per-call item cap is zero or exceeds `MAX_BATCH_SIZE`.
     InvalidBatchLimit = 11,
+    /// The funder has not approved enough token allowance to cover the
+    /// aggregate batch on the allowance-funded path.
+    InsufficientAllowance = 12,
 }
 
 /// Individual execution status for an item in a batch execution (Issue #697).
@@ -555,6 +560,83 @@ impl BatchTransferProcessor {
         env.events().publish(
             (Symbol::new(&env, "batch_transferred"), funder.clone()),
             (token.clone(), recipients.len(), total),
+        );
+
+        Ok(total)
+    }
+
+    /// Execute a batch funded by a pre-approved SEP-41 allowance (Issue #925).
+    ///
+    /// Unlike [`Self::process_batch`], which pulls the total with the funder's
+    /// own signature, this entry point spends the allowance the funder granted
+    /// to this processor (`approve(funder, processor, allowance, expiry)`).
+    /// The aggregate allowance is checked once, before any transfer, so an
+    /// under-approved batch fails up front instead of partway through the
+    /// fan-out.
+    ///
+    /// # Validation
+    /// Checks 1–5 match [`Self::process_batch`], followed by the allowance
+    /// pre-flight:
+    ///
+    /// 6. `allowance(funder, processor) >= sum(amounts)` — else
+    ///    [`Error::InsufficientAllowance`]
+    ///
+    /// The pre-flight is read-only and runs before the instance TTL bump, the
+    /// reentrancy lock, and any token movement.
+    ///
+    /// # Auth
+    /// `transfer_from` consumes the funder's pre-approved allowance; the
+    /// processor authorizes the pull as the spender. No direct
+    /// `funder.require_auth()` is requested, so the funder signs only the
+    /// standalone `approve` transaction.
+    ///
+    /// # Returns
+    /// The total number of tokens transferred on success.
+    pub fn process_batch_with_allowance(
+        env: Env,
+        funder: Address,
+        token: Address,
+        recipients: Vec<Address>,
+        amounts: Vec<i128>,
+    ) -> Result<i128, Error> {
+        let total = validate_total(&recipients, &amounts)?;
+        validate_token(&env, &token)?;
+
+        if total == 0 {
+            return Ok(0);
+        }
+
+        let tk = token::Client::new(&env, &token);
+        let contract_addr = env.current_contract_address();
+
+        // ── Allowance pre-flight ─────────────────────────────────────────
+        // One read for the whole batch: without it, an allowance smaller than
+        // the total would only surface inside `transfer_from`, after the
+        // reentrancy lock and TTL write have already been paid for.
+        if tk.allowance(&funder, &contract_addr) < total {
+            return Err(Error::InsufficientAllowance);
+        }
+
+        ttl::bump(&env);
+
+        if env.storage().temporary().has(&DataKey::ReentrancyLock) {
+            return Err(Error::ReentrancyForbidden);
+        }
+        env.storage()
+            .temporary()
+            .set(&DataKey::ReentrancyLock, &true);
+
+        tk.transfer_from(&contract_addr, &funder, &contract_addr, &total);
+
+        for (recipient, amount) in recipients.iter().zip(amounts.iter()) {
+            tk.transfer(&contract_addr, &recipient, &amount);
+        }
+
+        env.storage().temporary().remove(&DataKey::ReentrancyLock);
+
+        env.events().publish(
+            (Symbol::new(&env, "batch_transferred"), funder),
+            (token, recipients.len(), total),
         );
 
         Ok(total)

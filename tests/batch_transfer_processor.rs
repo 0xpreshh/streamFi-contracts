@@ -155,9 +155,9 @@ fn max_batch_size_matches_the_enforced_boundary() {
 #[test]
 fn version_reports_the_current_behaviour_version() {
     let f = setup();
-    // v2: SEP-41 token probe before auth, instance-TTL keep-alive, and
-    // `preview_batch`. Bumped whenever observable behaviour changes.
-    assert_eq!(f.client.version(), 2);
+    // v4 adds the allowance-funded batch entry point. Bumped whenever
+    // observable behaviour changes.
+    assert_eq!(f.client.version(), 4);
 }
 
 #[test]

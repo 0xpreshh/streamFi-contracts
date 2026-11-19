@@ -1381,6 +1381,91 @@ fn batch_deposit_while_paused_fails() {
     );
 }
 
+#[test]
+fn batch_deposit_partial_reports_successes_and_failures_without_reverting() {
+    let s = Setup::new(1_000_000);
+    let funded = Address::generate(&s.env);
+    let second_sender = Address::generate(&s.env);
+
+    let asset = token::StellarAssetClient::new(&s.env, &s.token.address);
+    asset.mint(&funded, &10_000);
+    asset.mint(&second_sender, &10_000);
+
+    let deposits = soroban_sdk::vec![
+        &s.env,
+        crate::DepositArgs {
+            from: funded.clone(),
+            amount: 5_000,
+        },
+        crate::DepositArgs {
+            from: second_sender.clone(),
+            amount: 0,
+        },
+        crate::DepositArgs {
+            from: funded.clone(),
+            amount: crate::MAX_VAULT_DEPOSIT + 1,
+        },
+    ];
+
+    let results = s.client.batch_deposit_partial(&deposits);
+    assert_eq!(results.len(), 3);
+
+    let first = results.get(0).unwrap();
+    assert!(first.success);
+    assert_eq!(first.error_code, None);
+    assert_eq!(first.deposited, 5_000);
+
+    let second = results.get(1).unwrap();
+    assert!(!second.success);
+    assert_eq!(second.error_code, Some(Error::InvalidAmount as u32));
+    assert_eq!(second.deposited, 0);
+
+    let third = results.get(2).unwrap();
+    assert!(!third.success);
+    assert_eq!(third.error_code, Some(Error::DepositExceedsMax as u32));
+
+    // Only the valid entry settled.
+    assert_eq!(s.token.balance(&s.client.address), 5_000);
+    assert_eq!(s.token.balance(&funded), 5_000);
+    assert_eq!(
+        s.client
+            .get_depositor_token_balance(&funded, &s.token.address),
+        5_000
+    );
+}
+
+#[test]
+fn batch_deposit_partial_rejects_entries_that_would_exceed_the_limit() {
+    let s = Setup::new(10_000);
+    let sponsor1 = Address::generate(&s.env);
+    let sponsor2 = Address::generate(&s.env);
+
+    let asset = token::StellarAssetClient::new(&s.env, &s.token.address);
+    asset.mint(&sponsor1, &10_000);
+    asset.mint(&sponsor2, &10_000);
+
+    let deposits = soroban_sdk::vec![
+        &s.env,
+        crate::DepositArgs {
+            from: sponsor1,
+            amount: 6_000,
+        },
+        crate::DepositArgs {
+            from: sponsor2,
+            amount: 6_000,
+        },
+    ];
+
+    let results = s.client.batch_deposit_partial(&deposits);
+    assert!(results.get(0).unwrap().success);
+    assert!(!results.get(1).unwrap().success);
+    assert_eq!(
+        results.get(1).unwrap().error_code,
+        Some(Error::LimitExceeded as u32)
+    );
+    assert_eq!(s.token.balance(&s.client.address), 6_000);
+}
+
 // ── Emergency Migration tests (Issue #679) ────────────────────────────────
 
 #[test]

@@ -48,6 +48,39 @@ pub const MAX_BATCH_SIZE: u32 = 10;
 fn is_zero_wasm_hash(env: &Env, hash: &BytesN<32>) -> bool {
     *hash == BytesN::from_array(env, &[0u8; 32])
 }
+
+/// Store the deployed stream count in temporary storage and renew its TTL
+/// (Issue #926).
+fn cache_stream_count(env: &Env, count: u64) {
+    let key = DataKey::StreamCountCache;
+    env.storage().temporary().set(&key, &count);
+    env.storage()
+        .temporary()
+        .extend_ttl(&key, ttl::THRESHOLD, ttl::EXTEND_TO);
+}
+
+/// Read the cached stream count, falling back to the durable instance counter
+/// and re-seeding the cache when the temporary entry has expired (Issue #926).
+fn read_stream_count(env: &Env) -> u64 {
+    let key = DataKey::StreamCountCache;
+    match env.storage().temporary().get::<_, u64>(&key) {
+        Some(count) => {
+            env.storage()
+                .temporary()
+                .extend_ttl(&key, ttl::THRESHOLD, ttl::EXTEND_TO);
+            count
+        }
+        None => {
+            let count: u64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::StreamCount)
+                .unwrap_or(0);
+            cache_stream_count(env, count);
+            count
+        }
+    }
+}
 #[contract]
 pub struct DripFactory;
 
@@ -78,6 +111,7 @@ impl DripFactory {
             .instance()
             .set(&DataKey::GovernorAddress, &governor);
         env.storage().instance().set(&DataKey::StreamCount, &0_u64);
+        cache_stream_count(&env, 0);
         env.storage().instance().set(
             &DataKey::Aggregate,
             &Aggregate {
@@ -402,6 +436,7 @@ impl DripFactory {
         env.storage()
             .instance()
             .set(&DataKey::StreamCount, &(stream_count + 1));
+        cache_stream_count(&env, stream_count + 1);
 
         // Increment aggregate counters after the new stream is fully persisted.
         let mut aggregate: Aggregate =
@@ -910,12 +945,12 @@ impl DripFactory {
     }
 
     /// Total number of streams ever created by this factory.
-    /// Total number of streams ever created by this factory.
+    ///
+    /// Served from the temporary counter cache when it is present, falling
+    /// back to the durable instance counter (and re-seeding the cache) after
+    /// expiry (Issue #926).
     pub fn stream_count(env: Env) -> u64 {
-        env.storage()
-            .instance()
-            .get(&DataKey::StreamCount)
-            .unwrap_or(0)
+        read_stream_count(&env)
     }
 
     /// Read-only: total stream count deployed by factory as a dedicated lightweight counter (Issue #708).

@@ -3130,6 +3130,25 @@ fn elapsed_seconds_calculates_stream_age_correctly() {
 }
 
 #[test]
+fn is_fully_vested_tracks_the_bounded_end_time() {
+    let s = Setup::new(10, 1_000, false);
+    let info = s
+        .env
+        .as_contract(&s.client.address, || crate::state::load(&s.env));
+
+    assert!(!info.is_fully_vested(info.start_time));
+    assert!(!info.is_fully_vested(info.end_time.saturating_sub(1)));
+    assert!(info.is_fully_vested(info.end_time));
+    assert!(info.is_fully_vested(info.end_time + 1));
+    assert!(crate::state::is_fully_vested(&info, info.end_time));
+
+    // Open-ended streams have no scheduled completion.
+    let mut open_ended = info.clone();
+    open_ended.end_time = 0;
+    assert!(!open_ended.is_fully_vested(u64::MAX));
+}
+
+#[test]
 fn auto_settle_full_remaining_balance_on_stream_end() {
     let s = Setup::new(1, 100, false);
     let now = s.env.ledger().timestamp();

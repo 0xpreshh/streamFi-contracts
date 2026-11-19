@@ -10,7 +10,7 @@ mod ttl;
 use drip_common::{is_zero_address, TTL_EXTEND_TO};
 use drip_stream::DripStreamClient;
 use errors::Error;
-use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, BytesN, Env, Map, Vec};
 use storage::{
     check_vault_balance, get_depositor_token_balance, get_emergency_migration, get_max_limit,
     get_operator, get_operator_withdraw_limit, get_owner, get_owner_proposal_ttl,
@@ -31,6 +31,19 @@ use ttl::bump_instance;
 pub struct DepositSpec {
     pub from: Address,
     pub amount: i128,
+}
+
+/// Alias for [`DepositSpec`] matching the batch-deposit issue interface (Issue #924).
+pub type DepositArgs = DepositSpec;
+
+/// Per-deposit outcome returned by [`TokenVault::batch_deposit_partial`] (Issue #924).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchDepositResult {
+    pub index: u32,
+    pub success: bool,
+    pub error_code: Option<u32>,
+    pub deposited: i128,
 }
 
 #[contract]
@@ -421,6 +434,143 @@ impl TokenVault {
 
             bump_instance(&env);
             Ok(())
+        })
+    }
+
+    /// Deposits from multiple senders and reports a per-item outcome (Issue #924).
+    ///
+    /// Unlike [`Self::batch_deposit`], which is atomic and reverts the whole
+    /// batch on the first failure, this variant validates and transfers each
+    /// entry independently so funded senders can settle even when another
+    /// sender is ineligible or its transfer fails. The vault accounting
+    /// (depositor balance, tracked account balance, and balance snapshot) is
+    /// updated only for the entries that actually transferred.
+    ///
+    /// Per-entry failures are reported as `success = false` with a stable
+    /// [`Error`] code in `error_code`; they do not revert the batch. Note that
+    /// every entry is authorized up front, so a missing authorization still
+    /// aborts the transaction at the host level — partial success covers
+    /// validation and token-transfer failures, not missing signatures.
+    ///
+    /// Every successful transfer is followed by a balance read compared
+    /// against the running expected total; if the token moved a different
+    /// amount, the whole call reverts with [`Error::DepositTransferFailed`]
+    /// rather than persisting corrupt accounting.
+    pub fn batch_deposit_partial(
+        env: Env,
+        deposits: Vec<DepositArgs>,
+    ) -> Result<Vec<BatchDepositResult>, Error> {
+        non_reentrant!(&env, {
+            assert_not_paused(&env)?;
+            if deposits.is_empty() {
+                return Err(Error::InvalidAmount);
+            }
+
+            let _owner = get_owner(&env).ok_or(Error::NotInitialized)?;
+            let max = get_max_limit(&env).ok_or(Error::NotInitialized)?;
+            let default_token = get_token(&env).ok_or(Error::NotInitialized)?;
+            if !is_token_approved(&env, &default_token) {
+                return Err(Error::TokenNotApprovedForVault);
+            }
+            let min_deposit = get_token_min_deposit(&env, &default_token);
+
+            let balance = vault_balance(&env)?;
+            if !check_vault_balance(&env, &default_token, balance) {
+                return Err(Error::VaultBalanceChanged);
+            }
+
+            let tk = token_client(&env)?;
+            let contract_addr = env.current_contract_address();
+            let mut results = Vec::new(&env);
+            let mut expected_balance = balance;
+
+            // Authorize every distinct depositor before moving any funds,
+            // matching the two-phase shape of `batch_deposit`.
+            let mut authorized: Map<Address, ()> = Map::new(&env);
+            for deposit in deposits.iter() {
+                if !authorized.contains_key(deposit.from.clone()) {
+                    deposit.from.require_auth();
+                    authorized.set(deposit.from.clone(), ());
+                }
+            }
+
+            for (index, deposit) in deposits.iter().enumerate() {
+                let failure = if deposit.amount <= 0 {
+                    Some(Error::InvalidAmount as u32)
+                } else if deposit.amount > MAX_VAULT_DEPOSIT {
+                    Some(Error::DepositExceedsMax as u32)
+                } else if min_deposit > 0 && deposit.amount < min_deposit {
+                    Some(Error::DepositBelowMin as u32)
+                } else {
+                    match expected_balance.checked_add(deposit.amount) {
+                        None => Some(Error::ArithmeticOverflow as u32),
+                        Some(projected) if projected > max => {
+                            Some(Error::LimitExceeded as u32)
+                        }
+                        Some(_) => None,
+                    }
+                };
+
+                if let Some(code) = failure {
+                    results.push_back(BatchDepositResult {
+                        index: index as u32,
+                        success: false,
+                        error_code: Some(code),
+                        deposited: 0,
+                    });
+                    continue;
+                }
+
+                if tk
+                    .try_transfer(&deposit.from, &contract_addr, &deposit.amount)
+                    .is_err()
+                {
+                    results.push_back(BatchDepositResult {
+                        index: index as u32,
+                        success: false,
+                        error_code: Some(Error::DepositTransferFailed as u32),
+                        deposited: 0,
+                    });
+                    continue;
+                }
+
+                expected_balance = expected_balance
+                    .checked_add(deposit.amount)
+                    .ok_or(Error::ArithmeticOverflow)?;
+
+                let cur_acc_bal =
+                    get_token_account_balance(&env, &default_token, &deposit.from);
+                let new_acc_bal = cur_acc_bal
+                    .checked_add(deposit.amount)
+                    .ok_or(Error::ArithmeticOverflow)?;
+                set_token_account_balance(&env, &default_token, &deposit.from, new_acc_bal);
+
+                let cur_dep_bal =
+                    get_depositor_token_balance(&env, &deposit.from, &default_token);
+                let new_dep_bal = cur_dep_bal
+                    .checked_add(deposit.amount)
+                    .ok_or(Error::ArithmeticOverflow)?;
+                set_depositor_token_balance(&env, &deposit.from, &default_token, new_dep_bal);
+                ttl::extend_balance_ttl(&env, &default_token, &deposit.from);
+
+                let new_balance = tk.balance(&contract_addr);
+                if new_balance != expected_balance {
+                    return Err(Error::DepositTransferFailed);
+                }
+                events::deposited(&env, &deposit.from, deposit.amount, new_balance);
+
+                results.push_back(BatchDepositResult {
+                    index: index as u32,
+                    success: true,
+                    error_code: None,
+                    deposited: deposit.amount,
+                });
+            }
+
+            record_vault_balance(&env, &default_token, expected_balance);
+
+            bump_instance(&env);
+            Ok(results)
         })
     }
 

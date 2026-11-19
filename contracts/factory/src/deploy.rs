@@ -50,8 +50,14 @@ pub fn deploy_stream_with_salt(
 
     env.storage().persistent().set(&salt_key, &true);
 
-    // Step 2: call `initialize` on the freshly deployed contract.
-    let _: () = env.invoke_contract(&addr, &Symbol::new(env, "initialize"), init_args);
+    // Step 2: call `initialize_with_metadata` on the freshly deployed
+    // contract. The variant accepts the optional metadata URI passed by
+    // `create_stream`; direct deployments can still use `initialize`.
+    let _: () = env.invoke_contract(
+        &addr,
+        &Symbol::new(env, "initialize_with_metadata"),
+        init_args,
+    );
 
     Ok(addr)
 }

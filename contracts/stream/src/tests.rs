@@ -3382,3 +3382,92 @@ fn test_stream_cliff_reached_event_and_cliff_claimed() {
     assert_eq!(s.client.is_cliff_claimed(), true);
 }
 
+// ── Issue #923: creation-time metadata URI ──────────────────────────────────
+
+fn init_with_metadata(
+    env: &Env,
+    metadata_uri: Option<String>,
+) -> (DripStreamClient<'_>, Address, Address) {
+    env.mock_all_auths();
+    let sender = Address::generate(env);
+    let recipient = Address::generate(env);
+    let token_addr = env
+        .register_stellar_asset_contract_v2(Address::generate(env))
+        .address();
+    let rate = 10i128;
+    let start = env.ledger().timestamp();
+    let end = start + 3_600;
+    let deposit = rate * 3_600;
+    token::StellarAssetClient::new(env, &token_addr).mint(&sender, &deposit);
+
+    let stream_id = env.register_contract(None, DripStream);
+    token::Client::new(env, &token_addr).transfer(&sender, &stream_id, &deposit);
+    let client = DripStreamClient::new(env, &stream_id);
+
+    client.initialize_with_metadata(
+        &sender,
+        &recipient,
+        &token_addr,
+        &rate,
+        &start,
+        &end,
+        &false,
+        &86_400u64,
+        &false,
+        &crate::StreamInitMetadata {
+            description: None,
+            metadata_uri,
+        },
+    );
+
+    (client, sender, token_addr)
+}
+
+#[test]
+fn initialize_with_metadata_stores_the_uri() {
+    let env = Env::default();
+    let uri = Some(String::from_str(&env, "ipfs://bafy/invoice-42"));
+    let (client, _sender, _token) = init_with_metadata(&env, uri.clone());
+
+    assert_eq!(client.metadata_uri(), uri);
+}
+
+#[test]
+fn initialize_without_metadata_reads_none() {
+    let env = Env::default();
+    let (client, _sender, _token) = init_with_metadata(&env, None);
+
+    assert_eq!(client.metadata_uri(), None);
+}
+
+#[test]
+fn initialize_with_metadata_rejects_a_uri_over_128_bytes() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_addr = env
+        .register_stellar_asset_contract_v2(Address::generate(&env))
+        .address();
+    let start = env.ledger().timestamp();
+    let stream_id = env.register_contract(None, DripStream);
+    let client = DripStreamClient::new(&env, &stream_id);
+
+    let result = client.try_initialize_with_metadata(
+        &sender,
+        &recipient,
+        &token_addr,
+        &10i128,
+        &start,
+        &(start + 3_600),
+        &false,
+        &86_400u64,
+        &false,
+        &crate::StreamInitMetadata {
+            description: None,
+            metadata_uri: Some(String::from_str(&env, &"x".repeat(129))),
+        },
+    );
+
+    assert!(result.is_err());
+}

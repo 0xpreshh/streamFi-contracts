@@ -1082,6 +1082,7 @@ fn high_stream_creation_concurrency() {
             &0u64, // open-ended
             &true, // clawback enabled
             &None,
+            &None,
         );
 
         // Ensure stream_ids don't collide
@@ -1144,6 +1145,7 @@ fn concurrent_stream_creation_maintains_factory_invariants() {
                 &0u64,
                 &false,
                 &None,
+                &None,
             );
         }
     }
@@ -1172,6 +1174,7 @@ fn create_stream_rejects_zero_deposit_before_governor_call() {
     let result = s.client.try_create_stream(
         &sender, &recipient, &token, &0i128, // deposit == 0
         &1i128, &0u64, &3_600u64, &false, &None,
+        &None,
     );
 
     assert_eq!(result, Err(Ok(Error::InvalidDeposit)));
@@ -1190,6 +1193,7 @@ fn create_stream_rejects_a_bounded_stream_shorter_than_the_minimum() {
         &sender, &recipient, &token, &3_600i128, &1i128, &0u64,
         &30u64, // shorter than MIN_STREAM_DURATION
         &false, &None,
+        &None,
     );
 
     assert_eq!(result, Err(Ok(Error::DurationTooShort)));
@@ -1213,9 +1217,34 @@ fn create_stream_rejects_a_description_over_128_bytes() {
         &3_600u64,
         &false,
         &Some(too_long),
+        &None,
     );
 
     assert_eq!(result, Err(Ok(Error::DescriptionTooLong)));
+}
+
+#[test]
+fn create_stream_rejects_a_metadata_uri_over_128_bytes() {
+    let s = Setup::new();
+    let sender = Address::generate(&s.env);
+    let recipient = Address::generate(&s.env);
+    let token = Address::generate(&s.env);
+    let too_long = soroban_sdk::String::from_str(&s.env, &"x".repeat(129));
+
+    let result = s.client.try_create_stream(
+        &sender,
+        &recipient,
+        &token,
+        &3_600i128,
+        &1i128,
+        &0u64,
+        &3_600u64,
+        &false,
+        &None,
+        &Some(too_long),
+    );
+
+    assert_eq!(result, Err(Ok(Error::MetadataUriTooLong)));
 }
 
 #[test]

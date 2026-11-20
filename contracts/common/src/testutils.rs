@@ -48,7 +48,7 @@ pub fn create_mock_token(env: &Env, admin: &Address) -> Address {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::token;
+    use soroban_sdk::{testutils::MockAuthInvoke, token, IntoVal};
 
     #[test]
     fn advance_time_and_ledgers_updates_both_clock_and_sequence() {
@@ -60,6 +60,31 @@ mod tests {
 
         assert_eq!(after.timestamp, before.timestamp + 120);
         assert_eq!(after.sequence_number, before.sequence_number + 24);
+    }
+
+    #[test]
+    fn mock_auth_context_authorizes_only_the_given_invocation() {
+        let env = Env::default();
+        let admin = create_test_address(&env);
+        let holder = create_test_address(&env);
+        let token_addr = create_mock_token(&env, &admin);
+        let asset = token::StellarAssetClient::new(&env, &token_addr);
+
+        mock_auth_context(
+            &env,
+            &admin,
+            &MockAuthInvoke {
+                contract: &token_addr,
+                fn_name: "mint",
+                args: (&holder, 100i128).into_val(&env),
+                sub_invokes: &[],
+            },
+        );
+        asset.mint(&holder, &100);
+        assert_eq!(token::Client::new(&env, &token_addr).balance(&holder), 100);
+
+        // A different invocation was never mocked, so it must not be authorized.
+        assert!(asset.try_mint(&holder, &50).is_err());
     }
 
     #[test]

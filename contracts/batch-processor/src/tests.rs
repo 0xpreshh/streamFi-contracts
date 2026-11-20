@@ -218,7 +218,7 @@ fn max_batch_size_reports_the_enforced_cap() {
 fn version_reports_the_current_behaviour_version() {
     let s = Setup::new();
     // v4 adds the allowance-funded batch entry point.
-    assert_eq!(s.client.version(), 4);
+    assert_eq!(s.client.version(), 5);
 }
 
 #[test]
@@ -1078,4 +1078,358 @@ fn test_fuzz_random_batch_amounts_boundary_100() {
         let cpu = s.env.budget().cpu_instruction_cost();
         assert!(cpu < 800_000, "fuzz batch {size} exceeded gas budget: {cpu}");
     }
+}
+
+// ── Issues #890 / #891 / #892: duplicate stream IDs, batch metrics, emergency pause ──
+
+mod stateful {
+    //! Separate module: `contractimpl` symbols would clash with `MockStreamContract`.
+    use soroban_sdk::{symbol_short, Address, Env};
+
+    #[soroban_sdk::contracterror]
+    #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+    #[repr(u32)]
+    pub enum MockStreamError {
+        Exhausted = 100,
+        AlreadyCancelled = 101,
+        AlreadyPaused = 102,
+        NotPaused = 103,
+    }
+
+    /// Stream double that keeps real state, so repeated calls in one batch
+    /// behave like they would against a live stream: the withdrawable balance
+    /// shrinks, and cancel / pause cannot be applied twice.
+    #[soroban_sdk::contract]
+    pub struct StatefulStream;
+
+    #[soroban_sdk::contractimpl]
+    impl StatefulStream {
+        pub fn init(env: Env, balance: i128) {
+            env.storage()
+                .instance()
+                .set(&symbol_short!("bal"), &balance);
+        }
+
+        pub fn withdrawable(env: Env) -> i128 {
+            env.storage()
+                .instance()
+                .get(&symbol_short!("bal"))
+                .unwrap_or(0)
+        }
+
+        pub fn withdraw(env: Env, amount: i128) -> Result<i128, MockStreamError> {
+            let bal: i128 = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("bal"))
+                .unwrap_or(0);
+            if amount > bal {
+                return Err(MockStreamError::Exhausted);
+            }
+            env.storage()
+                .instance()
+                .set(&symbol_short!("bal"), &(bal - amount));
+            let paid: i128 = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("paid"))
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&symbol_short!("paid"), &(paid + amount));
+            let calls: u32 = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("wcalls"))
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&symbol_short!("wcalls"), &(calls + 1));
+            Ok(amount)
+        }
+
+        pub fn paid(env: Env) -> i128 {
+            env.storage()
+                .instance()
+                .get(&symbol_short!("paid"))
+                .unwrap_or(0)
+        }
+
+        pub fn withdraw_calls(env: Env) -> u32 {
+            env.storage()
+                .instance()
+                .get(&symbol_short!("wcalls"))
+                .unwrap_or(0)
+        }
+
+        pub fn cancel(env: Env, caller: Address) -> Result<(), MockStreamError> {
+            caller.require_auth();
+            if env.storage().instance().has(&symbol_short!("cancel")) {
+                return Err(MockStreamError::AlreadyCancelled);
+            }
+            env.storage()
+                .instance()
+                .set(&symbol_short!("cancel"), &true);
+            Ok(())
+        }
+
+        pub fn is_cancelled(env: Env) -> bool {
+            env.storage().instance().has(&symbol_short!("cancel"))
+        }
+
+        pub fn emergency_pause(env: Env, caller: Address) -> Result<(), MockStreamError> {
+            caller.require_auth();
+            if Self::is_emergency_paused(env.clone()) {
+                return Err(MockStreamError::AlreadyPaused);
+            }
+            env.storage()
+                .instance()
+                .set(&symbol_short!("paused"), &true);
+            let n: u32 = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("pcalls"))
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&symbol_short!("pcalls"), &(n + 1));
+            Ok(())
+        }
+
+        pub fn emergency_unpause(env: Env, caller: Address) -> Result<(), MockStreamError> {
+            caller.require_auth();
+            if !Self::is_emergency_paused(env.clone()) {
+                return Err(MockStreamError::NotPaused);
+            }
+            env.storage()
+                .instance()
+                .set(&symbol_short!("paused"), &false);
+            Ok(())
+        }
+
+        pub fn is_emergency_paused(env: Env) -> bool {
+            env.storage()
+                .instance()
+                .get(&symbol_short!("paused"))
+                .unwrap_or(false)
+        }
+
+        pub fn pause_calls(env: Env) -> u32 {
+            env.storage()
+                .instance()
+                .get(&symbol_short!("pcalls"))
+                .unwrap_or(0)
+        }
+    }
+}
+use stateful::{MockStreamError, StatefulStream, StatefulStreamClient};
+
+fn stateful_stream(s: &Setup, balance: i128) -> StatefulStreamClient<'static> {
+    let id = s.env.register_contract(None, StatefulStream);
+    let env: &'static Env = std::boxed::Box::leak(std::boxed::Box::new(s.env.clone()));
+    let client = StatefulStreamClient::new(env, &id);
+    client.init(&balance);
+    client
+}
+
+fn addresses(s: &Setup, items: &[&Address]) -> Vec<Address> {
+    let mut v = Vec::new(&s.env);
+    for a in items {
+        v.push_back((*a).clone());
+    }
+    v
+}
+
+/// `(stream_count, elapsed_nanos)` from the last `batch_metrics` event of `batch_type`.
+fn batch_metrics(s: &Setup, batch_type: &str) -> Option<(u32, u64)> {
+    s.processor_events()
+        .into_iter()
+        .rev()
+        .find(|(_, topics, _)| {
+            topics.len() == 2
+                && Symbol::try_from_val(&s.env, &topics.get(0).unwrap()).ok()
+                    == Some(Symbol::new(&s.env, "batch_metrics"))
+                && Symbol::try_from_val(&s.env, &topics.get(1).unwrap()).ok()
+                    == Some(Symbol::new(&s.env, batch_type))
+        })
+        .map(|(_, _, data)| data.try_into_val(&s.env).unwrap())
+}
+
+#[test]
+fn duplicate_stream_ids_cannot_withdraw_more_than_the_stream_holds() {
+    let s = Setup::new();
+    let a = stateful_stream(&s, 500);
+    let b = stateful_stream(&s, 500);
+
+    let ids = addresses(&s, &[&a.address, &a.address, &b.address, &a.address]);
+    let amounts = s.amounts(&[300, 300, 100, 200]);
+    let results = s.client.batch_withdraw_lenient(&ids, &amounts);
+
+    assert_eq!(results.len(), 4);
+    // First A withdrawal succeeds; the repeat asks for more than is left and fails.
+    assert_eq!(results.get(0).unwrap(), (a.address.clone(), true, 0));
+    assert_eq!(
+        results.get(1).unwrap(),
+        (a.address.clone(), false, MockStreamError::Exhausted as u32)
+    );
+    assert_eq!(results.get(2).unwrap(), (b.address.clone(), true, 0));
+    // A third A entry within the remaining balance is honoured exactly once more.
+    assert_eq!(results.get(3).unwrap(), (a.address.clone(), true, 0));
+
+    assert_eq!(a.paid(), 500, "never more than the stream's balance");
+    assert_eq!(a.withdrawable(), 0);
+    assert_eq!(
+        a.withdraw_calls(),
+        2,
+        "failed attempts must not change stream state"
+    );
+    assert_eq!(b.paid(), 100);
+}
+
+#[test]
+fn duplicate_stream_ids_with_queried_amounts_withdraw_once() {
+    let s = Setup::new();
+    let a = stateful_stream(&s, 500);
+
+    let ids = addresses(&s, &[&a.address, &a.address, &a.address]);
+    let results = s.client.batch_withdraw_lenient(&ids, &Vec::new(&s.env));
+
+    assert_eq!(results.get(0).unwrap(), (a.address.clone(), true, 0));
+    // Re-queried `withdrawable` is now 0, so repeats are rejected up front.
+    for i in 1..3 {
+        assert_eq!(
+            results.get(i).unwrap(),
+            (a.address.clone(), false, Error::InvalidAmount as u32)
+        );
+    }
+    assert_eq!(a.paid(), 500);
+    assert_eq!(a.withdraw_calls(), 1);
+
+    // The reentrancy lock was released despite the repeated entries.
+    let again = s
+        .client
+        .batch_withdraw_lenient(&addresses(&s, &[&a.address]), &Vec::new(&s.env));
+    assert!(!again.get(0).unwrap().1);
+}
+
+#[test]
+fn duplicate_stream_ids_in_batch_cancel_revert_the_whole_batch() {
+    let s = Setup::new();
+    let a = stateful_stream(&s, 500);
+    let b = stateful_stream(&s, 500);
+    let caller = Address::generate(&s.env);
+
+    let ids = addresses(&s, &[&b.address, &a.address, &a.address]);
+    assert!(s.client.try_batch_cancel(&caller, &ids).is_err());
+
+    // Atomic: the stream cancelled before the duplicate was rolled back too.
+    assert!(!a.is_cancelled());
+    assert!(!b.is_cancelled());
+
+    let unique = addresses(&s, &[&b.address, &a.address]);
+    assert_eq!(s.client.batch_cancel(&caller, &unique), 2);
+    assert!(a.is_cancelled() && b.is_cancelled());
+}
+
+#[test]
+fn batch_withdraw_and_cancel_publish_batch_metrics() {
+    let s = Setup::new();
+    let a = stateful_stream(&s, 500);
+    let b = stateful_stream(&s, 500);
+
+    let ids = addresses(&s, &[&a.address, &b.address]);
+    s.client.batch_withdraw_lenient(&ids, &s.amounts(&[10, 20]));
+    assert_eq!(batch_metrics(&s, "withdraw"), Some((2, 0)));
+
+    let caller = Address::generate(&s.env);
+    s.client.batch_cancel(&caller, &ids);
+    assert_eq!(batch_metrics(&s, "cancel"), Some((2, 0)));
+}
+
+#[test]
+fn batch_pause_and_resume_toggle_every_stream_once() {
+    let s = Setup::new();
+    let admin = Address::generate(&s.env);
+    s.client.initialize(&admin);
+    let a = stateful_stream(&s, 500);
+    let b = stateful_stream(&s, 500);
+
+    let ids = addresses(&s, &[&a.address, &b.address, &a.address]);
+    assert_eq!(s.client.batch_pause(&admin, &ids), 2);
+    // Events are read before any other call, which would reset the recorder.
+    assert_eq!(batch_metrics(&s, "pause"), Some((2, 0)));
+    assert!(a.is_emergency_paused() && b.is_emergency_paused());
+    assert_eq!(a.pause_calls(), 1, "duplicate entries are paused once");
+
+    assert_eq!(s.client.batch_resume(&admin, &ids), 2);
+    assert_eq!(batch_metrics(&s, "resume"), Some((2, 0)));
+    assert!(!a.is_emergency_paused() && !b.is_emergency_paused());
+}
+
+#[test]
+fn batch_pause_is_atomic_when_one_stream_rejects() {
+    let s = Setup::new();
+    let admin = Address::generate(&s.env);
+    s.client.initialize(&admin);
+    let a = stateful_stream(&s, 500);
+    let b = stateful_stream(&s, 500);
+
+    s.client.batch_pause(&admin, &addresses(&s, &[&b.address]));
+    // `a` would pause, but `b` is already paused: nothing may change.
+    assert!(s
+        .client
+        .try_batch_pause(&admin, &addresses(&s, &[&a.address, &b.address]))
+        .is_err());
+    assert!(!a.is_emergency_paused());
+    assert!(b.is_emergency_paused());
+}
+
+#[test]
+fn batch_pause_requires_the_admin() {
+    let s = Setup::new();
+    let a = stateful_stream(&s, 500);
+    let admin = Address::generate(&s.env);
+    let ids = addresses(&s, &[&a.address]);
+
+    assert_eq!(
+        s.client.try_batch_pause(&admin, &ids),
+        Err(Ok(Error::NotInitialized))
+    );
+
+    s.client.initialize(&admin);
+    let intruder = Address::generate(&s.env);
+    assert_eq!(
+        s.client.try_batch_pause(&intruder, &ids),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert_eq!(
+        s.client.try_batch_resume(&intruder, &ids),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert!(!a.is_emergency_paused());
+
+    let mut oversized = Vec::new(&s.env);
+    for _ in 0..(MAX_BATCH_SIZE + 1) {
+        oversized.push_back(a.address.clone());
+    }
+    assert_eq!(
+        s.client.try_batch_pause(&admin, &oversized),
+        Err(Ok(Error::BatchTooLarge))
+    );
+    assert_eq!(s.client.batch_pause(&admin, &Vec::new(&s.env)), 0);
+}
+
+#[test]
+fn batch_pause_requires_admin_authorization() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, super::BatchTransferProcessor);
+    let client = BatchTransferProcessorClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    let stream = env.register_contract(None, StatefulStream);
+    let mut ids = Vec::new(&env);
+    ids.push_back(stream);
+
+    // No auth mocked: the admin's signature is required.
+    assert!(client.try_batch_pause(&admin, &ids).is_err());
 }

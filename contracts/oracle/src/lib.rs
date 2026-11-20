@@ -4462,6 +4462,15 @@ mod tests {
         );
     }
 
+    // Circuit-breaker and failover coverage:
+    // - #978 secondary feed when the primary is stale:
+    //   test_fallback_oracle_feed_automatic_failover
+    // - #979 deviation threshold between consecutive updates:
+    //   test_price_deviation_circuit_breaker,
+    //   hard_oracle_deviation_limit_rejects_moves_over_fifty_percent
+    // - #980 volatility spikes:
+    //   volatility_spike_is_rejected_and_keeps_last_accepted_price,
+    //   gradual_decline_passes_the_breaker_but_the_same_move_in_one_jump_does_not
     fn volatility_config() -> OracleConfig {
         OracleConfig {
             decimals: 8,

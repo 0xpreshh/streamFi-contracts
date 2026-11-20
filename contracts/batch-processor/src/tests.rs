@@ -218,7 +218,7 @@ fn max_batch_size_reports_the_enforced_cap() {
 fn version_reports_the_current_behaviour_version() {
     let s = Setup::new();
     // v4 adds the allowance-funded batch entry point.
-    assert_eq!(s.client.version(), 4);
+    assert_eq!(s.client.version(), 5);
 }
 
 #[test]

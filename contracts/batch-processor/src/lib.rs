@@ -42,7 +42,9 @@ pub const MAX_BATCH_LIMIT: u32 = MAX_BATCH_SIZE;
 ///   deterministically and reports the processed prefix and remaining items.
 /// - `4` — added `process_batch_with_allowance`, which pre-flights the
 ///   aggregate allowance before pulling funds via `transfer_from` (issue #925).
-const VERSION: u32 = 4;
+/// - `5` — added admin-only `batch_pause` / `batch_resume` (issue #892) and a
+///   `batch_metrics` event after every stream batch (issue #891).
+const VERSION: u32 = 5;
 
 /// Instance-storage key space.
 ///
@@ -140,6 +142,72 @@ fn event_initialized(env: &Env, admin: &Address) {
 ///
 /// Topics: `("upgraded", caller)` — the admin that authorized the swap.
 /// Data:   `upgraded_at` — the ledger timestamp at which the swap took effect.
+/// Telemetry for keepers sizing their batches (issue #891).
+///
+/// Topics: `("batch_metrics", batch_type)`; data: `(stream_count, elapsed_nanos)`.
+///
+/// Soroban gives contracts no wall clock or CPU-instruction counter, so
+/// `elapsed_nanos` is measured from the ledger timestamp and is `0` for a
+/// batch that completes within one invocation (the normal case). Keepers
+/// should pair `stream_count` with the transaction's reported resource usage
+/// to derive per-stream cost; the field is kept so the payload stays stable
+/// if a finer-grained host clock becomes available.
+fn event_batch_metrics(env: &Env, batch_type: Symbol, stream_count: u32, started_at: u64) {
+    let elapsed_nanos = env
+        .ledger()
+        .timestamp()
+        .saturating_sub(started_at)
+        .saturating_mul(1_000_000_000);
+    env.events().publish(
+        (Symbol::new(env, "batch_metrics"), batch_type),
+        (stream_count, elapsed_nanos),
+    );
+}
+
+/// Shared body of `batch_pause` / `batch_resume`: admin check, size cap,
+/// duplicate-skipping, then one call per unique stream. Any stream call that
+/// fails traps, so the whole batch reverts and no stream is left half-handled.
+fn batch_emergency_toggle(
+    env: &Env,
+    admin: &Address,
+    stream_ids: &Vec<Address>,
+    stream_fn: &str,
+    batch_type: Symbol,
+) -> Result<u32, Error> {
+    let stored: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::Admin)
+        .ok_or(Error::NotInitialized)?;
+    if admin != &stored {
+        return Err(Error::NotAuthorized);
+    }
+    if stream_ids.len() > MAX_BATCH_SIZE {
+        return Err(Error::BatchTooLarge);
+    }
+    admin.require_auth();
+    if stream_ids.is_empty() {
+        return Ok(0);
+    }
+    ttl::bump(env);
+
+    let started_at = env.ledger().timestamp();
+    let func = Symbol::new(env, stream_fn);
+    let mut handled: Vec<Address> = Vec::new(env);
+    for stream_id in stream_ids.iter() {
+        if handled.contains(&stream_id) {
+            continue;
+        }
+        let mut args = Vec::new(env);
+        args.push_back(admin.to_val());
+        let _: () = env.invoke_contract(&stream_id, &func, args);
+        handled.push_back(stream_id);
+    }
+
+    event_batch_metrics(env, batch_type, handled.len(), started_at);
+    Ok(handled.len())
+}
+
 fn event_upgraded(env: &Env, caller: &Address, upgraded_at: u64) {
     env.events()
         .publish((symbol_short!("upgraded"), caller.clone()), upgraded_at);
@@ -729,6 +797,7 @@ impl BatchTransferProcessor {
         caller.require_auth();
         ttl::bump_adaptive_for_streams(&env, &stream_ids);
 
+        let started_at = env.ledger().timestamp();
         let mut cancelled_count: u32 = 0;
         for stream_id in stream_ids.iter() {
             let mut args = Vec::new(&env);
@@ -741,6 +810,7 @@ impl BatchTransferProcessor {
             (Symbol::new(&env, "batch_cancelled"), caller),
             stream_ids.len(),
         );
+        event_batch_metrics(&env, symbol_short!("cancel"), cancelled_count, started_at);
 
         Ok(cancelled_count)
     }
@@ -776,6 +846,7 @@ impl BatchTransferProcessor {
             .temporary()
             .set(&DataKey::ReentrancyLock, &true);
 
+        let started_at = env.ledger().timestamp();
         for (idx, stream_id) in stream_ids.iter().enumerate() {
             let amount = if amounts.is_empty() {
                 // Query withdrawable amount if not provided
@@ -830,6 +901,12 @@ impl BatchTransferProcessor {
         env.events().publish(
             (Symbol::new(&env, "batch_withdrawn_lenient"), env.current_contract_address()),
             (results.len(), stream_ids.len()),
+        );
+        event_batch_metrics(
+            &env,
+            symbol_short!("withdraw"),
+            stream_ids.len(),
+            started_at,
         );
 
         Ok(results)

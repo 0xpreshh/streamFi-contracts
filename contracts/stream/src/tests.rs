@@ -3594,3 +3594,73 @@ fn new_error_codes_match_issue_values() {
     assert_eq!(Error::StreamNotPaused as u32, 121);
     assert_eq!(Error::FunderNotApproved as u32, 122);
 }
+
+// ---- #933: revoke, retry, authorization and cancelled-stream edge cases ----
+
+#[test]
+fn revoked_funder_is_rejected_and_retry_succeeds_after_reapproval() {
+    let s = Setup::new(100, 3_600, false);
+    let funder = mint_to_new_funder(&s, 2_000);
+    s.client.approve_funder(&s.sender, &funder);
+    s.client.revoke_funder(&s.sender, &funder);
+    assert!(!s.client.is_approved_funder(&funder));
+
+    let rejected = s.client.try_top_up_by_funder(&funder, &500);
+    assert_eq!(rejected, Err(Ok(Error::FunderNotApproved)));
+    assert_eq!(s.token.balance(&funder), 2_000);
+
+    s.client.approve_funder(&s.sender, &funder);
+    let retried = s.client.try_top_up_by_funder(&funder, &500);
+    assert_eq!(retried, Ok(Ok(())));
+    assert_eq!(s.token.balance(&funder), 1_500);
+}
+
+#[test]
+fn approve_funder_is_idempotent() {
+    let s = Setup::new(100, 3_600, false);
+    let funder = mint_to_new_funder(&s, 1_000);
+    s.client.approve_funder(&s.sender, &funder);
+    s.client.approve_funder(&s.sender, &funder);
+    assert!(s.client.is_approved_funder(&funder));
+    assert_eq!(s.client.try_top_up_by_funder(&funder, &1_000), Ok(Ok(())));
+}
+
+#[test]
+fn non_sender_cannot_revoke_funder() {
+    let s = Setup::new(100, 3_600, false);
+    let funder = mint_to_new_funder(&s, 1_000);
+    s.client.approve_funder(&s.sender, &funder);
+    let rando = Address::generate(&s.env);
+    let result = s.client.try_revoke_funder(&rando, &funder);
+    assert_eq!(result, Err(Ok(Error::NotAuthorized)));
+    assert!(s.client.is_approved_funder(&funder));
+}
+
+#[test]
+fn top_up_by_funder_rejected_on_cancelled_stream() {
+    let s = Setup::new(100, 3_600, false);
+    let funder = mint_to_new_funder(&s, 1_000);
+    s.client.approve_funder(&s.sender, &funder);
+    s.client.cancel(&s.sender);
+    let result = s.client.try_top_up_by_funder(&funder, &1_000);
+    assert_eq!(result, Err(Ok(Error::StreamCancelled)));
+    assert_eq!(s.token.balance(&funder), 1_000);
+}
+
+#[test]
+fn open_top_up_still_accepts_unapproved_third_party() {
+    // Regression for #690: the existing open top_up path is not gated by approval.
+    let s = Setup::new(100, 3_600, false);
+    let funder = mint_to_new_funder(&s, 1_000);
+    assert_eq!(s.client.try_top_up(&funder, &1_000), Ok(Ok(())));
+}
+
+#[test]
+fn rejected_resume_then_pause_retry_emits_events_once_each() {
+    let s = Setup::new(100, 3_600, false);
+    assert_eq!(s.client.try_resume(&s.sender), Err(Ok(Error::NotPaused)));
+    s.client.pause(&s.sender);
+    assert!(has_event_named(&s.env, "StreamPaused"));
+    s.client.resume(&s.sender);
+    assert!(has_event_named(&s.env, "StreamResumed"));
+}

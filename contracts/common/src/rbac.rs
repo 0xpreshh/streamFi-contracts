@@ -87,7 +87,17 @@ pub enum RbacError {
 
 // ── Core helpers ──────────────────────────────────────────────────────────
 
-/// Role assignment tracking optional expiration timestamp (Issue #692).
+/// Stored value for a granted role (Issue #692, Issue #973).
+///
+/// `expires_at` is a ledger timestamp in seconds. From that timestamp on
+/// (`now >= expires_at`, compared with `env.ledger().timestamp()`) the grant no
+/// longer passes `has_role`, `require_role` or `require_role_or_admin`.
+/// `None` means the grant never expires.
+///
+/// Storage entries written without an expiry are treated as non-expiring. Legacy
+/// boolean entries from before this struct existed are read through the fallback
+/// branch of `has_role`. The storage key layout is unchanged, so no migration is
+/// needed for the key shape.
 #[soroban_sdk::contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RoleAssignment {

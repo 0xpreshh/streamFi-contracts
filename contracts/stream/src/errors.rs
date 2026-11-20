@@ -62,4 +62,8 @@ pub enum Error {
     StreamNotPaused = 121,
     /// The caller is not an approved funder for this stream (#933).
     FunderNotApproved = 122,
+    /// A cliff timestamp is before stream inception or before the current ledger (#947).
+    CliffTimestampInvalid = 123,
+    /// The recipient is the all-zero Stellar address (#947).
+    RecipientInvalid = 124,
 }

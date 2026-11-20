@@ -2,6 +2,7 @@ use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{Address, BytesN, Env, Symbol, Val, Vec};
 
 use crate::errors::Error;
+use crate::governance;
 use crate::storage::DataKey;
 use crate::{events, pause, ttl};
 
@@ -112,6 +113,8 @@ pub fn set_stream_wasm_hash(env: &Env, new_wasm_hash: &BytesN<32>) -> Result<(),
             .instance()
             .set(&DataKey::StreamWasmHash, new_wasm_hash);
         events::stream_contract_upgraded(env, &old_wasm_hash, new_wasm_hash);
+        // Version history and deprecation notice for the superseded hash (Issue #902).
+        governance::record_wasm_version_change(env, &old_wasm_hash, new_wasm_hash);
     }
     Ok(())
 }

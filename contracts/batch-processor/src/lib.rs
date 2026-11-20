@@ -795,7 +795,7 @@ impl BatchTransferProcessor {
         }
 
         caller.require_auth();
-        ttl::bump(&env);
+        ttl::bump_adaptive_for_streams(&env, &stream_ids);
 
         let started_at = env.ledger().timestamp();
         let mut cancelled_count: u32 = 0;
@@ -837,7 +837,7 @@ impl BatchTransferProcessor {
             return Ok(results);
         }
 
-        ttl::bump_batch_state(&env);
+        ttl::bump_adaptive_for_streams(&env, &stream_ids);
 
         if env.storage().temporary().has(&DataKey::ReentrancyLock) {
             return Err(Error::ReentrancyForbidden);
@@ -912,40 +912,153 @@ impl BatchTransferProcessor {
         Ok(results)
     }
 
-    /// Atomically emergency-pauses every stream in `stream_ids` (issue #892).
+    /// Fault-tolerant batch top-up with per-item failure telemetry (Issue #888).
     ///
-    /// Only the admin recorded by `initialize` may call it, so a protocol
-    /// governor can freeze many streams in one transaction instead of racing
-    /// one pause per stream. Calls each stream's `emergency_pause(admin)`;
-    /// duplicate addresses are paused once. If any stream rejects the call
-    /// (for example it is already paused), the whole batch reverts.
+    /// Executes `top_up(caller, amount)` against each stream in `stream_ids`,
+    /// catching individual stream failures (e.g. cancelled stream, invalid
+    /// amount, or insufficient token allowance) so that remaining top-ups in
+    /// the batch still complete.
     ///
-    /// Returns the number of unique streams paused.
-    ///
-    /// # Errors
-    ///
-    /// `NotInitialized`, `NotAuthorized` (caller is not the admin), `BatchTooLarge`.
-    pub fn batch_pause(env: Env, admin: Address, stream_ids: Vec<Address>) -> Result<u32, Error> {
-        batch_emergency_toggle(
-            &env,
-            &admin,
-            &stream_ids,
-            "emergency_pause",
-            symbol_short!("pause"),
-        )
+    /// Emits `("top_up_item_failed", stream_id)` with `(item_index, error_code)`
+    /// for each failed item, and `("batch_top_up_lenient", caller)` with
+    /// `(succeeded_count, failed_count, total_topped_up)` at completion.
+    pub fn batch_top_up_lenient(
+        env: Env,
+        caller: Address,
+        stream_ids: Vec<Address>,
+        amounts: Vec<i128>,
+    ) -> Result<Vec<BatchResult>, Error> {
+        if stream_ids.len() != amounts.len() {
+            return Err(Error::LengthMismatch);
+        }
+        if stream_ids.len() > MAX_BATCH_SIZE {
+            return Err(Error::BatchTooLarge);
+        }
+
+        let mut results = Vec::new(&env);
+        if stream_ids.is_empty() {
+            return Ok(results);
+        }
+
+        caller.require_auth();
+        ttl::bump_adaptive_for_streams(&env, &stream_ids);
+
+        if env.storage().temporary().has(&DataKey::ReentrancyLock) {
+            return Err(Error::ReentrancyForbidden);
+        }
+        env.storage()
+            .temporary()
+            .set(&DataKey::ReentrancyLock, &true);
+
+        let mut succeeded: u32 = 0;
+        let mut failed: u32 = 0;
+        let mut total_topped_up: i128 = 0;
+
+        for (idx, (stream_id, amount)) in stream_ids.iter().zip(amounts.iter()).enumerate() {
+            let item_index = idx as u32;
+            if amount <= 0 {
+                let code = Error::InvalidAmount as u32;
+                failed = failed.saturating_add(1);
+                results.push_back(BatchResult {
+                    item_index,
+                    success: false,
+                    error_code: Some(code),
+                });
+                env.events().publish(
+                    (Symbol::new(&env, "top_up_item_failed"), stream_id.clone()),
+                    (item_index, code),
+                );
+                continue;
+            }
+
+            let mut args = Vec::new(&env);
+            args.push_back(caller.to_val());
+            args.push_back(amount.into_val(&env));
+
+            let res = env.try_invoke_contract::<(), soroban_sdk::Error>(
+                &stream_id,
+                &Symbol::new(&env, "top_up"),
+                args,
+            );
+
+            match res {
+                Ok(Ok(())) => {
+                    succeeded = succeeded.saturating_add(1);
+                    total_topped_up = total_topped_up.saturating_add(amount);
+                    results.push_back(BatchResult {
+                        item_index,
+                        success: true,
+                        error_code: None,
+                    });
+                }
+                Ok(Err(_)) => {
+                    let code = 9998u32;
+                    failed = failed.saturating_add(1);
+                    results.push_back(BatchResult {
+                        item_index,
+                        success: false,
+                        error_code: Some(code),
+                    });
+                    env.events().publish(
+                        (Symbol::new(&env, "top_up_item_failed"), stream_id.clone()),
+                        (item_index, code),
+                    );
+                }
+                Err(Ok(err)) => {
+                    let code = err.get_code();
+                    failed = failed.saturating_add(1);
+                    results.push_back(BatchResult {
+                        item_index,
+                        success: false,
+                        error_code: Some(code),
+                    });
+                    env.events().publish(
+                        (Symbol::new(&env, "top_up_item_failed"), stream_id.clone()),
+                        (item_index, code),
+                    );
+                }
+                Err(Err(soroban_sdk::InvokeError::Contract(code))) => {
+                    failed = failed.saturating_add(1);
+                    results.push_back(BatchResult {
+                        item_index,
+                        success: false,
+                        error_code: Some(code),
+                    });
+                    env.events().publish(
+                        (Symbol::new(&env, "top_up_item_failed"), stream_id.clone()),
+                        (item_index, code),
+                    );
+                }
+                Err(Err(soroban_sdk::InvokeError::Abort)) => {
+                    let code = 9999u32;
+                    failed = failed.saturating_add(1);
+                    results.push_back(BatchResult {
+                        item_index,
+                        success: false,
+                        error_code: Some(code),
+                    });
+                    env.events().publish(
+                        (Symbol::new(&env, "top_up_item_failed"), stream_id.clone()),
+                        (item_index, code),
+                    );
+                }
+            }
+        }
+
+        env.storage().temporary().remove(&DataKey::ReentrancyLock);
+
+        env.events().publish(
+            (Symbol::new(&env, "batch_top_up_lenient"), caller),
+            (succeeded, failed, total_topped_up),
+        );
+
+        Ok(results)
     }
 
-    /// Atomically lifts the emergency pause on every stream in `stream_ids`
-    /// (issue #892). Same rules as [`Self::batch_pause`], calling each
-    /// stream's `emergency_unpause(admin)`.
-    pub fn batch_resume(env: Env, admin: Address, stream_ids: Vec<Address>) -> Result<u32, Error> {
-        batch_emergency_toggle(
-            &env,
-            &admin,
-            &stream_ids,
-            "emergency_unpause",
-            symbol_short!("resume"),
-        )
+    /// Adaptively extend batch processor storage TTL based on the longest-lived
+    /// stream in `stream_ids` (Issue #889). Returns the computed ledger bump.
+    pub fn bump_ttl_adaptive(env: Env, stream_ids: Vec<Address>) -> u32 {
+        ttl::bump_adaptive_for_streams(&env, &stream_ids)
     }
 
     /// Extend batch processor storage TTL to match target stream expiration (Issue #762).

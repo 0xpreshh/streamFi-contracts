@@ -284,6 +284,26 @@ macro_rules! ensure_active_ttl {
     };
 }
 
+/// Extends the instance TTL to `bump_to` only when the remaining TTL is at or
+/// below `threshold`, so a call that finds the TTL still healthy does nothing.
+///
+/// Both values are ledger counts, the same units as [`bump_instance`].
+///
+/// # Panics
+/// Panics when `bump_to < threshold`. Such a pair can never leave the entry
+/// above the threshold after a bump, so it is a caller bug rather than a
+/// state to tolerate silently.
+///
+/// # Implementation note
+/// The current instance TTL is not read here. The Soroban SDK (21.x) exposes
+/// `get_ttl` only in `testutils`, so the threshold check is delegated to
+/// `extend_ttl`, which the host applies only while the TTL is below the
+/// threshold. See NOTES.md for the boundary and this limitation.
+pub fn check_and_bump_ttl(env: &Env, threshold: u32, bump_to: u32) {
+    assert!(bump_to >= threshold, "bump_to must be >= threshold");
+    env.storage().instance().extend_ttl(threshold, bump_to);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

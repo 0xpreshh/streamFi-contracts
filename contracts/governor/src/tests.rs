@@ -568,3 +568,87 @@ fn proposals_are_indexed_by_status_transitions() {
         .proposals_by_status(&ProposalStatus::Pending)
         .is_empty());
 }
+
+#[test]
+fn test_comprehensive_voting_power_snapshotting_across_ledger_boundaries() {
+    use soroban_sdk::testutils::Ledger as _;
+
+    let (env, authority, fee_recipient, factory_address) = create_test_env();
+    let contract_id = env.register_contract(None, DripGovernor);
+    let client = DripGovernorClient::new(&env, &contract_id);
+
+    client.initialize(&authority, &fee_recipient, &factory_address);
+    configure_proposal_stake(&env, &client, &authority);
+
+    let voter_a = Address::generate(&env);
+    let voter_b = Address::generate(&env);
+    let voter_c = Address::generate(&env);
+
+    // Scenario 1: Voter A has 500 tokens at ledger 100
+    env.ledger().set_sequence_number(100);
+    client.checkpoint_balance(&authority, &voter_a, &500);
+    assert_eq!(client.get_prior_votes(&voter_a, &100), 500);
+
+    // Scenario 2: Proposal created at ledger 110 (captures snapshot)
+    env.ledger().set_sequence_number(110);
+    let proposal_1 = client.propose(&authority, &3600);
+    assert_eq!(client.proposal_snapshot_ledger(&proposal_1), 110);
+
+    // Scenario 3: Voter A votes with full 500 tokens
+    client.cast_vote(&voter_a, &proposal_1, &true);
+    assert_eq!(client.get_proposal(&proposal_1).for_votes, 500);
+
+    // Scenario 4: At ledger 120, voter A transfers 300 tokens to voter B
+    env.ledger().set_sequence_number(120);
+    client.checkpoint_balance(&authority, &voter_a, &200);
+    client.checkpoint_balance(&authority, &voter_b, &300);
+
+    // Scenario 5: Voter B had 0 tokens at ledger 110 snapshot, cannot vote
+    assert_eq!(
+        client.try_cast_vote(&voter_b, &proposal_1, &true),
+        Err(Ok(Error::InsufficientVotingWeight))
+    );
+
+    // Scenario 6: Voter A still cannot vote again (already voted)
+    assert_eq!(
+        client.try_cast_vote(&voter_a, &proposal_1, &true),
+        Err(Ok(Error::AlreadyVoted))
+    );
+
+    // Scenario 7: Voter C who had no weight at any snapshot cannot vote
+    assert_eq!(
+        client.try_cast_vote(&voter_c, &proposal_1, &true),
+        Err(Ok(Error::InsufficientVotingWeight))
+    );
+
+    // Scenario 8: Create second proposal at ledger 130, voter B now has voting power
+    env.ledger().set_sequence_number(130);
+    let proposal_2 = client.propose(&authority, &3600);
+    assert_eq!(client.proposal_snapshot_ledger(&proposal_2), 130);
+
+    // Voter B can vote on proposal_2 (had 300 tokens at ledger 130)
+    assert!(client.try_cast_vote(&voter_b, &proposal_2, &true).is_ok());
+    assert_eq!(client.get_proposal(&proposal_2).for_votes, 300);
+
+    // Voter A can vote on proposal_2 with updated weight of 200 (from ledger 120 checkpoint)
+    assert!(client.try_cast_vote(&voter_a, &proposal_2, &false).is_ok());
+    assert_eq!(client.get_proposal(&proposal_2).against_votes, 200);
+
+    // Scenario 9: Further token movement at ledger 140
+    env.ledger().set_sequence_number(140);
+    client.checkpoint_balance(&authority, &voter_b, &0);
+    client.checkpoint_balance(&authority, &voter_c, &300);
+
+    // Create proposal_3 at ledger 150
+    env.ledger().set_sequence_number(150);
+    let proposal_3 = client.propose(&authority, &3600);
+
+    // Voter C can vote on proposal_3 (has 300 at ledger 150)
+    assert!(client.try_cast_vote(&voter_c, &proposal_3, &true).is_ok());
+
+    // Voter B cannot vote on proposal_3 (had 0 at ledger 150)
+    assert_eq!(
+        client.try_cast_vote(&voter_b, &proposal_3, &true),
+        Err(Ok(Error::InsufficientVotingWeight))
+    );
+}

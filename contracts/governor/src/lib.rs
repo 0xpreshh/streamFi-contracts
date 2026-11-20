@@ -932,7 +932,7 @@ impl DripGovernor {
             &env.current_contract_address(),
             &stake_config.min_proposal_stake,
         );
-        ttl::bump(&env);
+        ttl::extend_for_proposal(&env, Self::MIN_EXECUTION_DELAY, execution_window_secs);
 
         let counter: u64 = env
             .storage()

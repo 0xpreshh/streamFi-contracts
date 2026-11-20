@@ -3490,3 +3490,107 @@ fn initialize_with_metadata_rejects_a_uri_over_128_bytes() {
 
     assert!(result.is_err());
 }
+
+// ---- #933: sender-approved third-party funder top-up ----
+
+fn mint_to_new_funder(s: &Setup, amount: i128) -> Address {
+    let who = Address::generate(&s.env);
+    token::StellarAssetClient::new(&s.env, &s.token.address).mint(&who, &amount);
+    who
+}
+
+#[test]
+fn approved_funder_top_up_increases_stream_balance() {
+    let s = Setup::new(100, 3_600, false);
+    let funder = mint_to_new_funder(&s, 1_000);
+    s.client.approve_funder(&s.sender, &funder);
+    assert!(s.client.is_approved_funder(&funder));
+
+    let before = s.token.balance(&s.client.address);
+    s.client.top_up_by_funder(&funder, &1_000);
+
+    assert_eq!(s.token.balance(&s.client.address), before + 1_000);
+    assert_eq!(s.token.balance(&funder), 0);
+}
+
+#[test]
+fn unapproved_funder_top_up_is_rejected() {
+    let s = Setup::new(100, 3_600, false);
+    let funder = mint_to_new_funder(&s, 1_000);
+    let result = s.client.try_top_up_by_funder(&funder, &1_000);
+    assert_eq!(result, Err(Ok(Error::FunderNotApproved)));
+    assert_eq!(s.token.balance(&funder), 1_000);
+}
+
+#[test]
+fn non_sender_cannot_approve_funder() {
+    let s = Setup::new(100, 3_600, false);
+    let rando = Address::generate(&s.env);
+    let funder = mint_to_new_funder(&s, 1_000);
+    let result = s.client.try_approve_funder(&rando, &funder);
+    assert_eq!(result, Err(Ok(Error::NotAuthorized)));
+    assert!(!s.client.is_approved_funder(&funder));
+}
+
+#[test]
+fn top_up_by_funder_rejects_zero_amount() {
+    let s = Setup::new(100, 3_600, false);
+    let funder = mint_to_new_funder(&s, 1_000);
+    s.client.approve_funder(&s.sender, &funder);
+    let result = s.client.try_top_up_by_funder(&funder, &0);
+    assert_eq!(result, Err(Ok(Error::InvalidAmount)));
+}
+
+// ---- #935: StreamPaused / StreamResumed events ----
+
+fn has_event_named(env: &Env, name: &str) -> bool {
+    let want = soroban_sdk::Symbol::new(env, name);
+    for (_addr, topics, _data) in env.events().all().iter() {
+        let first: Option<soroban_sdk::Symbol> = topics.get(0).and_then(|v| v.try_into_val(env).ok());
+        if first == Some(want.clone()) {
+            return true;
+        }
+    }
+    false
+}
+
+#[test]
+fn pause_emits_stream_paused_event() {
+    let s = Setup::new(100, 3_600, false);
+    s.client.pause(&s.sender);
+    assert!(has_event_named(&s.env, "StreamPaused"));
+}
+
+#[test]
+fn resume_emits_stream_resumed_event() {
+    let s = Setup::new(100, 3_600, false);
+    s.client.pause(&s.sender);
+    s.client.resume(&s.sender);
+    assert!(has_event_named(&s.env, "StreamResumed"));
+}
+
+#[test]
+fn rejected_double_pause_emits_no_stream_paused_event() {
+    let s = Setup::new(100, 3_600, false);
+    s.client.pause(&s.sender);
+    let result = s.client.try_pause(&s.sender);
+    assert_eq!(result, Err(Ok(Error::AlreadyPaused)));
+    assert!(!has_event_named(&s.env, "StreamPaused"));
+}
+
+#[test]
+fn rejected_resume_when_active_emits_no_stream_resumed_event() {
+    let s = Setup::new(100, 3_600, false);
+    let result = s.client.try_resume(&s.sender);
+    assert_eq!(result, Err(Ok(Error::NotPaused)));
+    assert!(!has_event_named(&s.env, "StreamResumed"));
+}
+
+// ---- #946: new error codes ----
+
+#[test]
+fn new_error_codes_match_issue_values() {
+    assert_eq!(Error::StreamAlreadyPaused as u32, 120);
+    assert_eq!(Error::StreamNotPaused as u32, 121);
+    assert_eq!(Error::FunderNotApproved as u32, 122);
+}

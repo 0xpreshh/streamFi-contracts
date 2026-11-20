@@ -1,8 +1,99 @@
 use drip_governor::DripGovernorClient;
 pub use drip_governor::GovernorConfig;
-use soroban_sdk::{Address, Env};
+use soroban_sdk::{Address, BytesN, Env, Vec};
 
-use crate::Error;
+use crate::storage::DataKey;
+use crate::{events, Error};
+
+/// One entry in the stream WASM version history (Issue #902).
+///
+/// Version numbers start at 1 and increase by one per governance-driven change
+/// of the stream WASM hash.
+#[soroban_sdk::contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WasmVersionInfo {
+    /// One-based, monotonically increasing version number.
+    pub version_number: u32,
+    /// WASM hash that became the stream deployment hash at `deployed_at_ledger`.
+    pub wasm_hash: BytesN<32>,
+    /// Ledger sequence at which this hash was set. `0` marks a legacy entry
+    /// (a factory initialised before version history was recorded) whose
+    /// deployment ledger is unknown.
+    pub deployed_at_ledger: u32,
+}
+
+/// Records the first stream WASM version when the factory is initialised (Issue #902).
+pub fn record_initial_wasm_version(env: &Env, wasm_hash: &BytesN<32>) {
+    let mut history: Vec<WasmVersionInfo> = Vec::new(env);
+    history.push_back(WasmVersionInfo {
+        version_number: 1,
+        wasm_hash: wasm_hash.clone(),
+        deployed_at_ledger: env.ledger().sequence(),
+    });
+    env.storage()
+        .instance()
+        .set(&DataKey::WasmVersionHistory, &history);
+}
+
+/// Records a governance-driven change of the stream WASM hash (Issue #902).
+///
+/// Appends the new hash with the current ledger, then publishes one deprecation
+/// notice for the version it supersedes. A factory initialised before version
+/// history existed has no recorded versions, so the superseded hash is
+/// backfilled as version 1 with `deployed_at_ledger = 0` before the new entry is
+/// appended.
+///
+/// Callers must invoke this only when the hash actually changes; re-setting the
+/// current hash records nothing.
+pub fn record_wasm_version_change(
+    env: &Env,
+    old_wasm_hash: &BytesN<32>,
+    new_wasm_hash: &BytesN<32>,
+) {
+    let mut history: Vec<WasmVersionInfo> = env
+        .storage()
+        .instance()
+        .get(&DataKey::WasmVersionHistory)
+        .unwrap_or(Vec::new(env));
+
+    if history.is_empty() {
+        history.push_back(WasmVersionInfo {
+            version_number: 1,
+            wasm_hash: old_wasm_hash.clone(),
+            deployed_at_ledger: 0,
+        });
+    }
+
+    let superseded = history.get(history.len() - 1).unwrap();
+    let new_version_number = superseded.version_number.saturating_add(1);
+    history.push_back(WasmVersionInfo {
+        version_number: new_version_number,
+        wasm_hash: new_wasm_hash.clone(),
+        deployed_at_ledger: env.ledger().sequence(),
+    });
+    env.storage()
+        .instance()
+        .set(&DataKey::WasmVersionHistory, &history);
+
+    events::wasm_version_deprecated(
+        env,
+        superseded.version_number,
+        &superseded.wasm_hash,
+        new_version_number,
+    );
+}
+
+/// Full stream WASM version history, oldest first (Issue #902).
+///
+/// The last entry matches the hash currently used for deployments. Returns an
+/// empty vector only for a factory whose history has never been recorded and
+/// that has not had its hash changed since.
+pub fn wasm_version_history(env: &Env) -> Vec<WasmVersionInfo> {
+    env.storage()
+        .instance()
+        .get(&DataKey::WasmVersionHistory)
+        .unwrap_or(Vec::new(env))
+}
 
 /// Fetches the live protocol config from `governor` via a cross-contract call.
 ///
@@ -286,6 +377,109 @@ mod tests {
             enforce_bounds(&cfg, 1, NOW, NOW + cfg.max_duration_seconds + 1, NOW),
             Err(Error::DurationExceedsMax)
         );
+    }
+
+    // ── Stream WASM version history (Issue #902) ────────────────────────────
+
+    use crate::{DripFactory, DripFactoryClient};
+    use soroban_sdk::testutils::{Events as _, Ledger as _};
+
+    /// Registers and initialises a factory with `[1; 32]` as its stream WASM hash.
+    /// Auth is mocked so the governor-gated upgrade path authorises automatically.
+    fn factory(env: &Env) -> (Address, DripFactoryClient<'static>) {
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, DripFactory);
+        let client = DripFactoryClient::new(env, &contract_id);
+        client.initialize(&BytesN::from_array(env, &[1u8; 32]), &Address::generate(env));
+        (contract_id, client)
+    }
+
+    #[test]
+    fn initialize_records_version_one_at_the_current_ledger() {
+        let env = Env::default();
+        env.ledger().set_sequence_number(42);
+        let (_, client) = factory(&env);
+
+        let history = client.wasm_version_history();
+
+        assert_eq!(history.len(), 1);
+        let v1 = history.get(0).unwrap();
+        assert_eq!(v1.version_number, 1);
+        assert_eq!(v1.wasm_hash, BytesN::from_array(&env, &[1u8; 32]));
+        assert_eq!(v1.deployed_at_ledger, 42);
+    }
+
+    #[test]
+    fn upgrade_appends_a_version_with_its_ledger_and_sets_the_hash() {
+        let env = Env::default();
+        let (_, client) = factory(&env);
+        env.ledger().set_sequence_number(100);
+        let new_hash = BytesN::from_array(&env, &[2u8; 32]);
+
+        client.upgrade_stream_wasm(&new_hash);
+
+        assert_eq!(client.stream_wasm_hash(), new_hash);
+        let history = client.wasm_version_history();
+        assert_eq!(history.len(), 2);
+        let v2 = history.get(1).unwrap();
+        assert_eq!(v2.version_number, 2);
+        assert_eq!(v2.wasm_hash, new_hash);
+        assert_eq!(v2.deployed_at_ledger, 100);
+    }
+
+    #[test]
+    fn superseded_version_emits_a_deprecation_notice() {
+        let env = Env::default();
+        let (_, client) = factory(&env);
+        let before = env.events().all().len();
+
+        client.upgrade_stream_wasm(&BytesN::from_array(&env, &[2u8; 32]));
+
+        // One `StreamContractUpgraded` plus one deprecation notice for version 1.
+        assert_eq!(env.events().all().len(), before + 2);
+    }
+
+    #[test]
+    fn re_setting_the_current_hash_records_nothing() {
+        let env = Env::default();
+        let (_, client) = factory(&env);
+        let before_events = env.events().all().len();
+
+        client.upgrade_stream_wasm(&BytesN::from_array(&env, &[1u8; 32]));
+
+        assert_eq!(client.wasm_version_history().len(), 1);
+        assert_eq!(env.events().all().len(), before_events);
+    }
+
+    #[test]
+    fn rejected_zero_hash_leaves_history_unchanged() {
+        let env = Env::default();
+        let (_, client) = factory(&env);
+
+        let result = client.try_upgrade_stream_wasm(&BytesN::from_array(&env, &[0u8; 32]));
+
+        assert!(result.is_err());
+        assert_eq!(client.wasm_version_history().len(), 1);
+    }
+
+    #[test]
+    fn legacy_factory_without_history_is_backfilled_on_first_upgrade() {
+        let env = Env::default();
+        let (contract_id, client) = factory(&env);
+        // Simulate a factory initialised before version history existed.
+        env.as_contract(&contract_id, || {
+            env.storage().instance().remove(&DataKey::WasmVersionHistory);
+        });
+
+        client.upgrade_stream_wasm(&BytesN::from_array(&env, &[2u8; 32]));
+
+        let history = client.wasm_version_history();
+        assert_eq!(history.len(), 2);
+        let legacy = history.get(0).unwrap();
+        assert_eq!(legacy.version_number, 1);
+        assert_eq!(legacy.wasm_hash, BytesN::from_array(&env, &[1u8; 32]));
+        assert_eq!(legacy.deployed_at_ledger, 0);
+        assert_eq!(history.get(1).unwrap().version_number, 2);
     }
 
     #[test]

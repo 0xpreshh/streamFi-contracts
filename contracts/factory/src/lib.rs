@@ -20,7 +20,7 @@ use soroban_sdk::{
 use drip_common::is_zero_address;
 
 pub use errors::Error;
-pub use governance::FeeUpdateProposal;
+pub use governance::{FeeUpdateProposal, WasmVersionInfo};
 pub use pause::PauseType;
 use storage::DataKey;
 pub use storage::{
@@ -107,6 +107,7 @@ impl DripFactory {
         env.storage()
             .instance()
             .set(&DataKey::StreamWasmHash, &stream_wasm_hash);
+        governance::record_initial_wasm_version(&env, &stream_wasm_hash);
         env.storage()
             .instance()
             .set(&DataKey::GovernorAddress, &governor);
@@ -472,6 +473,10 @@ impl DripFactory {
         //   Value: Vec<u64> (ordered list of stream IDs where this address is recipient)
         //          XDR serialization: XDR-encoded Vec of u64 elements
         index::append_recipient_index(&env, &recipient, stream_id);
+
+        // Reverse-lookup index: streams deployed for this token (Issue #900).
+        // Batch creation reaches this path too, so it is covered.
+        index::append_token_index(&env, &token, &stream_addr);
 
         env.storage().instance().set(&DataKey::CreateLock, &false);
         Ok(stream_id)
@@ -886,6 +891,21 @@ impl DripFactory {
         Self::get_streams_by_creator_paged(env, creator, 0, query::MAX_PAGE_SIZE)
     }
 
+    /// Cursor-paginated stream addresses created by `creator` (Issue #901).
+    ///
+    /// `start_offset` is a position in the creator's stream history; at most
+    /// `limit` IDs are read, clamped to [`query::MAX_PAGE_SIZE`]. Advance the
+    /// cursor by the requested window, not by the returned length, since an
+    /// expired stream address is skipped. See [`query::get_streams_by_creator_paginated`].
+    pub fn get_streams_by_creator_paginated(
+        env: Env,
+        creator: Address,
+        start_offset: u32,
+        limit: u32,
+    ) -> Vec<Address> {
+        query::get_streams_by_creator_paginated(&env, creator, start_offset, limit)
+    }
+
     /// Alias for [`Self::get_streams_by_creator`] (Issue #678).
     pub fn streams_by_creator(env: Env, creator: Address) -> Vec<Address> {
         Self::get_streams_by_creator(env, creator)
@@ -975,6 +995,17 @@ impl DripFactory {
         count
     }
 
+    /// Paginated reverse lookup: stream contract addresses deployed for `token`,
+    /// in creation order (Issue #900). `limit` is clamped to 100.
+    pub fn get_streams_by_token(
+        env: Env,
+        token: Address,
+        start_index: u32,
+        limit: u32,
+    ) -> Vec<Address> {
+        index::get_streams_by_token(&env, token, start_index, limit)
+    }
+
     /// Read-only: alias for deployed_stream_count_by_token (Issue #720).
     pub fn stream_count_by_token(env: Env, token: Address) -> u64 {
         Self::deployed_stream_count_by_token(env, token)
@@ -1029,6 +1060,15 @@ impl DripFactory {
     /// activity even if no `create_stream` calls happen between upgrades.
     pub fn upgrade_stream_wasm(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
         deploy::set_stream_wasm_hash(&env, &new_wasm_hash)
+    }
+
+    /// Read-only: full stream WASM version history, oldest first (Issue #902).
+    ///
+    /// The last entry matches [`Self::stream_wasm_hash`]. Each entry records the
+    /// ledger at which its hash was set, so off-chain consumers can match a
+    /// stream's deployment time to the code it was created with.
+    pub fn wasm_version_history(env: Env) -> Vec<WasmVersionInfo> {
+        governance::wasm_version_history(&env)
     }
 
     /// Read-only: the WASM hash currently configured for stream deployments (Issue #626).

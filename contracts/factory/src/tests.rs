@@ -208,7 +208,9 @@ fn set_stream_wasm_hash_updates_hash_for_new_streams_and_emits_event() {
     assert_eq!(set_hash(&s, &new_hash), Ok(()));
 
     assert_eq!(s.client.stream_wasm_hash(), new_hash);
-    assert_eq!(s.event_count(), before + 1);
+    // StreamContractUpgraded plus the deprecation notice for the superseded
+    // version 1 (Issue #902).
+    assert_eq!(s.event_count(), before + 2);
 }
 
 #[test]

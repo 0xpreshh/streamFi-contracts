@@ -330,4 +330,19 @@ pub enum DataKey {
     /// TTL bump on every read; falls back to the durable instance counter when
     /// the temporary entry has expired.
     StreamCountCache,
+    /// **Persistent storage.** Reverse-lookup index of the stream contracts deployed
+    /// for a token (Issue #900), for analytics such as "every stream distributing
+    /// this asset".
+    /// Key: `DataKey::StreamsByToken(Address)` — the token contract address
+    /// Value: `Vec<Address>` — deployed DripStream addresses in creation order
+    /// Serialization: XDR tagged union [discriminant: u32][token: XDR Address] → [stream_addresses: XDR Vec<Address>]
+    /// TTL: Extended to `ttl::EXTEND_TO` (200_000 ledgers) on each new stream
+    StreamsByToken(Address),
+    /// **Instance storage.** Append-only history of the stream WASM hashes set via
+    /// governance (Issue #902). Each entry records the version number, the hash, and
+    /// the ledger at which it became the deployment hash.
+    /// Key: `DataKey::WasmVersionHistory` (no inner type, discriminant only)
+    /// Value: `Vec<WasmVersionInfo>` — oldest first. The last entry always matches
+    /// `DataKey::StreamWasmHash`.
+    WasmVersionHistory,
 }

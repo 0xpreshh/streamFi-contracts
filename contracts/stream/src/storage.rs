@@ -108,6 +108,17 @@ pub enum DataKey {
     ApprovedFunder(Address),
     /// Time-bounded emergency cancellation delegate configured by the sender (#886).
     CancelDelegate,
+    /// Delegate the recipient allowed to claim on its behalf via `claim_for` (#878).
+    ClaimDelegate,
+}
+
+/// Claim delegate granted by a recipient (#878). The grant is tied to the
+/// recipient that made it, so it stops working if the recipient changes.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimDelegateConfig {
+    pub recipient: Address,
+    pub delegate: Address,
 }
 
 /// Emergency cancellation delegate with a time-bounded expiration timestamp (#886).

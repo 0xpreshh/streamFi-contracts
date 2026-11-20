@@ -15,8 +15,8 @@ use drip_common::{is_zero_address, pause};
 
 pub use errors::Error;
 pub use storage::{
-    CancelDelegateConfig, CancelledStreamRecord, CliffConfig, SplitConfig, StreamConfig,
-    StreamKeeperRewardPool, StreamStatus, StreamSummary,
+    CancelDelegateConfig, CancelledStreamRecord, ClaimDelegateConfig, CliffConfig, SplitConfig,
+    StreamConfig, StreamKeeperRewardPool, StreamStatus, StreamSummary,
 };
 use storage::{
     DataKey, RateCheckpoint, StreamInfo, FLAG_CLAWBACK_ENABLED, FLAG_PAUSED, FLAG_REGULATED_ASSET,
@@ -115,6 +115,30 @@ fn require_cancel_authorized(env: &Env, caller: &Address, sender: &Address) -> R
         }
     }
     Err(Error::NotAuthorized)
+}
+
+/// Check that `delegate` holds a claim grant from the stream's current
+/// recipient and that `recipient` names that recipient, then consume the
+/// delegate's auth (#878).
+fn require_claim_delegate(
+    env: &Env,
+    delegate: &Address,
+    recipient: &Address,
+    current_recipient: &Address,
+) -> Result<(), Error> {
+    if recipient != current_recipient {
+        return Err(Error::NotAuthorized);
+    }
+    let granted = env
+        .storage()
+        .instance()
+        .get::<_, ClaimDelegateConfig>(&DataKey::ClaimDelegate)
+        .is_some_and(|cfg| &cfg.recipient == current_recipient && &cfg.delegate == delegate);
+    if !granted {
+        return Err(Error::NotAuthorized);
+    }
+    delegate.require_auth();
+    Ok(())
 }
 
 fn auto_forward_address(env: &Env, recipient: &Address) -> Address {
@@ -430,10 +454,74 @@ impl DripStream {
 
     /// Recipient withdraws `amount` tokens.
     pub fn withdraw(env: Env, amount: i128) -> Result<i128, Error> {
-        state::with_guard(&env, |env| Self::_withdraw(env, amount))
+        state::with_guard(&env, |env| Self::_withdraw(env, amount, None))
     }
 
-    fn _withdraw(env: &Env, amount: i128) -> Result<i128, Error> {
+    /// Recipient allows `delegate` to claim vested tokens on its behalf with
+    /// `claim_for` (#878), replacing any earlier delegate. Claimed tokens are
+    /// always paid to the recipient (or its auto-forward address), never to
+    /// the delegate.
+    pub fn set_claim_delegate(env: Env, delegate: Address) -> Result<(), Error> {
+        let info = state::try_load(&env)?;
+        info.recipient.require_auth();
+        if is_zero_address(&env, &delegate) || delegate == info.recipient {
+            return Err(Error::InvalidRecipient);
+        }
+
+        ttl::bump(&env);
+        let cfg = ClaimDelegateConfig {
+            recipient: info.recipient.clone(),
+            delegate: delegate.clone(),
+        };
+        env.storage().instance().set(&DataKey::ClaimDelegate, &cfg);
+        events::claim_delegate_set(&env, &info.recipient, &delegate);
+        Ok(())
+    }
+
+    /// Recipient removes its claim delegate (#878).
+    pub fn revoke_claim_delegate(env: Env) -> Result<(), Error> {
+        let info = state::try_load(&env)?;
+        info.recipient.require_auth();
+
+        ttl::bump(&env);
+        env.storage().instance().remove(&DataKey::ClaimDelegate);
+        events::claim_delegate_revoked(&env, &info.recipient);
+        Ok(())
+    }
+
+    /// The current recipient's claim delegate, if any (#878).
+    pub fn claim_delegate(env: Env) -> Option<Address> {
+        let info = state::try_load(&env).ok()?;
+        env.storage()
+            .instance()
+            .get::<_, ClaimDelegateConfig>(&DataKey::ClaimDelegate)
+            .filter(|cfg| cfg.recipient == info.recipient)
+            .map(|cfg| cfg.delegate)
+    }
+
+    /// Delegate claims up to `amount` vested tokens for `recipient` (#878).
+    ///
+    /// Requires the delegate's auth and a grant from the current recipient
+    /// via `set_claim_delegate`. Runs the same checks as `withdraw` and pays
+    /// the recipient, so the delegate never takes custody.
+    pub fn claim_for(
+        env: Env,
+        delegate: Address,
+        recipient: Address,
+        amount: i128,
+    ) -> Result<i128, Error> {
+        state::with_guard(&env, |env| {
+            Self::_withdraw(env, amount, Some((&delegate, &recipient)))
+        })
+    }
+
+    /// Shared withdraw path. `claimant` is `Some((delegate, recipient))` for
+    /// `claim_for`, `None` when the recipient withdraws directly.
+    fn _withdraw(
+        env: &Env,
+        amount: i128,
+        claimant: Option<(&Address, &Address)>,
+    ) -> Result<i128, Error> {
         if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
@@ -442,7 +530,12 @@ impl DripStream {
 
         let info = state::load(env);
         state::assert_not_cancelled(&info)?;
-        info.recipient.require_auth();
+        match claimant {
+            None => info.recipient.require_auth(),
+            Some((delegate, recipient)) => {
+                require_claim_delegate(env, delegate, recipient, &info.recipient)?
+            }
+        }
 
         let min_interval: u64 = env
             .storage()
@@ -544,6 +637,9 @@ impl DripStream {
             .checked_sub(to_send)
             .ok_or(Error::ArithmeticOverflow)?;
         events::withdrawn(env, &info.recipient, to_send, new_withdrawn, remaining);
+        if let Some((delegate, _)) = claimant {
+            events::claimed_for(env, delegate, &info.recipient, to_send);
+        }
 
         // Check if cliff timestamp was reached and emit event once (Issues #676, #752)
         let cliff_opt: Option<CliffConfig> = env.storage().instance().get(&DataKey::CliffConfig);
@@ -1245,6 +1341,17 @@ impl DripStream {
             info.end_time,
             new_end_time,
         );
+        if new_end_time > info.end_time {
+            let new_total_deposit = cumulative_deposited(env, &updated)?;
+            events::top_up_extended(
+                env,
+                caller,
+                info.end_time,
+                new_end_time,
+                amount,
+                new_total_deposit,
+            );
+        }
 
         Ok(())
     }
@@ -2549,6 +2656,16 @@ impl DripStream {
     ) -> Result<(), Error> {
         let _info = state::try_load(&env)?;
         ttl::emergency_extend_custom(&env, min_ledgers_to_live, ledgers_to_extend)
+    }
+
+    /// Keeper heartbeat that refreshes the instance TTL of a multi-year
+    /// vesting stream (#880). Any relayer may call it; no auth is needed.
+    pub fn bump_long_term_stream_ttl(
+        env: Env,
+        threshold: u32,
+        bump_ledgers: u32,
+    ) -> Result<(), Error> {
+        ttl::bump_long_term_stream_ttl(&env, threshold, bump_ledgers)
     }
 
     /// Estimated ledger sequence at which this stream ends, used by the batch

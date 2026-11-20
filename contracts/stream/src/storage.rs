@@ -106,6 +106,16 @@ pub enum DataKey {
     CancelledRecord,
     /// Funder approved by the sender to call `top_up_by_funder` (#933).
     ApprovedFunder(Address),
+    /// Time-bounded emergency cancellation delegate configured by the sender (#886).
+    CancelDelegate,
+}
+
+/// Emergency cancellation delegate with a time-bounded expiration timestamp (#886).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancelDelegateConfig {
+    pub delegate: Address,
+    pub expires_at: u64,
 }
 
 /// Immutable stream configuration stored in instance storage for cheaper reads (Issue #702).

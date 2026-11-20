@@ -73,6 +73,32 @@ pub fn extend_stream_ttl(env: &soroban_sdk::Env) {
     }
 }
 
+/// Emergency keeper renewal with caller-specified TTL threshold and extend
+/// target, guarded by protocol sanity bounds (Issue #887).
+///
+/// # Bounds
+/// - `min_ledgers_to_live > 0`
+/// - `ledgers_to_extend > 0`
+/// - `min_ledgers_to_live <= ledgers_to_extend`
+/// - `ledgers_to_extend <= MAX_TTL_LEDGERS`
+pub fn emergency_extend_custom(
+    env: &soroban_sdk::Env,
+    min_ledgers_to_live: u32,
+    ledgers_to_extend: u32,
+) -> Result<(), crate::errors::Error> {
+    if min_ledgers_to_live == 0
+        || ledgers_to_extend == 0
+        || min_ledgers_to_live > ledgers_to_extend
+        || ledgers_to_extend > MAX_TTL_LEDGERS
+    {
+        return Err(crate::errors::Error::InvalidAmount);
+    }
+    env.storage()
+        .instance()
+        .extend_ttl(min_ledgers_to_live, ledgers_to_extend);
+    Ok(())
+}
+
 /// Low-cost keeper maintenance function for stream instances.
 ///
 /// Extends the TTL of an active stream's instance storage when the remaining

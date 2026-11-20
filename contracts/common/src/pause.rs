@@ -568,3 +568,53 @@ mod tests {
         });
     }
 }
+
+#[cfg(test)]
+mod pause_flag_tests {
+    use super::PauseFlags;
+
+    #[test]
+    fn flags_are_distinct_single_bits_and_all_covers_them() {
+        let mut seen = 0u32;
+        for f in [
+            PauseFlags::PAUSE_DEPOSITS,
+            PauseFlags::PAUSE_WITHDRAWALS,
+            PauseFlags::PAUSE_CREATIONS,
+        ] {
+            assert_eq!(f.bits().count_ones(), 1);
+            assert_eq!(seen & f.bits(), 0);
+            seen |= f.bits();
+        }
+        assert_eq!(PauseFlags::ALL.bits(), seen);
+    }
+
+    #[test]
+    fn default_and_empty_are_nothing_paused() {
+        assert!(PauseFlags::default().is_empty());
+        assert_eq!(PauseFlags::default(), PauseFlags::empty());
+    }
+
+    #[test]
+    fn from_bits_rejects_unknown_bits() {
+        assert_eq!(PauseFlags::from_bits(0), Some(PauseFlags::empty()));
+        assert_eq!(
+            PauseFlags::from_bits(PauseFlags::ALL.bits()),
+            Some(PauseFlags::ALL)
+        );
+        assert_eq!(PauseFlags::from_bits(1 << 31), None);
+        assert_eq!(PauseFlags::from_bits(PauseFlags::ALL.bits() | 1 << 3), None);
+    }
+
+    #[test]
+    fn union_contains_and_intersects_follow_bitwise_semantics() {
+        let dep = PauseFlags::PAUSE_DEPOSITS;
+        let wd = PauseFlags::PAUSE_WITHDRAWALS;
+        let both = dep.union(wd);
+        assert!(both.contains(dep));
+        assert!(both.contains(wd));
+        assert!(!dep.contains(wd));
+        assert!(both.intersects(wd));
+        assert!(!dep.intersects(wd));
+        assert!(!PauseFlags::empty().intersects(PauseFlags::ALL));
+    }
+}

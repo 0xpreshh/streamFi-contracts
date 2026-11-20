@@ -104,6 +104,8 @@ pub enum DataKey {
     AutoSettle,
     /// Persistent storage record of stream cancellation reason and metadata (Issue #755).
     CancelledRecord,
+    /// Funder approved by the sender to call `top_up_by_funder` (#933).
+    ApprovedFunder(Address),
 }
 
 /// Immutable stream configuration stored in instance storage for cheaper reads (Issue #702).

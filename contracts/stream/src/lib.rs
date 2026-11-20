@@ -728,6 +728,7 @@ impl DripStream {
         state::save(env, &updated);
 
         events::paused(env, caller, now, w);
+        events::stream_paused(env, now);
         Ok(())
     }
 
@@ -765,6 +766,7 @@ impl DripStream {
         state::save(env, &updated);
 
         events::stream_paused_by_recipient(env, &info.recipient, now, w);
+        events::stream_paused(env, now);
         Ok(())
     }
 
@@ -843,6 +845,7 @@ impl DripStream {
         }
 
         events::resumed(env, caller, now);
+        events::stream_resumed(env, now);
         Ok(())
     }
 
@@ -992,6 +995,71 @@ impl DripStream {
         let new_balance = tk.balance(&contract_addr);
         events::topped_up(env, caller, amount, new_balance);
         Ok(())
+    }
+
+    /// Sender approves `funder` to add funds to this stream via `top_up_by_funder` (#933).
+    ///
+    /// Only the sender may grant approval. Approving an already-approved funder is a no-op.
+    pub fn approve_funder(env: Env, caller: Address, funder: Address) -> Result<(), Error> {
+        let info = state::load(&env);
+        state::assert_not_cancelled(&info)?;
+        if caller != info.sender {
+            return Err(Error::NotAuthorized);
+        }
+        caller.require_auth();
+        ttl::bump(&env);
+
+        let key = DataKey::ApprovedFunder(funder.clone());
+        if env.storage().instance().has(&key) {
+            return Ok(());
+        }
+        env.storage().instance().set(&key, &true);
+        events::funder_approved(&env, &caller, &funder);
+        Ok(())
+    }
+
+    /// Sender revokes a funder approval granted by `approve_funder` (#933).
+    ///
+    /// Revoking a funder that is not approved is a no-op.
+    pub fn revoke_funder(env: Env, caller: Address, funder: Address) -> Result<(), Error> {
+        let info = state::load(&env);
+        state::assert_not_cancelled(&info)?;
+        if caller != info.sender {
+            return Err(Error::NotAuthorized);
+        }
+        caller.require_auth();
+        ttl::bump(&env);
+
+        let key = DataKey::ApprovedFunder(funder.clone());
+        if env.storage().instance().has(&key) {
+            env.storage().instance().remove(&key);
+            events::funder_revoked(&env, &caller, &funder);
+        }
+        Ok(())
+    }
+
+    /// Read-only: whether `funder` is currently approved to top up this stream (#933).
+    pub fn is_approved_funder(env: Env, funder: Address) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::ApprovedFunder(funder))
+            .unwrap_or(false)
+    }
+
+    /// An approved third-party funder adds `amount` to the stream (#933).
+    ///
+    /// Same accounting as [`top_up`](Self::top_up), but gated on the sender's
+    /// approval. The open `top_up` entry point (#690) is left unchanged.
+    pub fn top_up_by_funder(env: Env, funder: Address, amount: i128) -> Result<(), Error> {
+        if amount <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        state::with_guard(&env, |env| {
+            if !Self::is_approved_funder(env.clone(), funder.clone()) {
+                return Err(Error::FunderNotApproved);
+            }
+            Self::_top_up(env, &funder, amount)
+        })
     }
 
     /// Sender or delegated operator extends the stream duration by `extra_time_seconds`.

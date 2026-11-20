@@ -289,6 +289,73 @@ pub fn require_not_paused_flag(paused: bool) -> Result<(), PausedError> {
     }
 }
 
+/// Granular pause flags for the protocol's three protected operation classes
+/// (Issue #975).
+///
+/// A bitfield so each class can be halted independently of the others:
+///
+/// - [`PauseFlags::PAUSE_DEPOSITS`] blocks intake of new funds (deposit-bearing
+///   stream creation, and top-ups once the stream side is wired to it).
+/// - [`PauseFlags::PAUSE_WITHDRAWALS`] blocks recipient withdrawals.
+/// - [`PauseFlags::PAUSE_CREATIONS`] blocks deployment of new stream contracts.
+///
+/// Cancellations are deliberately not covered by any flag: a cancel returns
+/// the recipient's vested share and the sender's refund, so gating it would
+/// trap funds in exactly the way the blanket pause does today. See `NOTES.md`.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub struct PauseFlags(u32);
+
+impl PauseFlags {
+    /// Blocks deposit intake.
+    pub const PAUSE_DEPOSITS: Self = Self(1 << 0);
+    /// Blocks withdrawals; deposits and creations are unaffected by this bit.
+    pub const PAUSE_WITHDRAWALS: Self = Self(1 << 1);
+    /// Blocks deployment of new stream contracts.
+    pub const PAUSE_CREATIONS: Self = Self(1 << 2);
+    /// Every defined flag set together.
+    pub const ALL: Self = Self(Self::PAUSE_DEPOSITS.0 | Self::PAUSE_WITHDRAWALS.0 | Self::PAUSE_CREATIONS.0);
+
+    /// No flags set: nothing is paused.
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    /// The raw bit representation, as stored and exposed on-chain.
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// Builds flags from raw bits. Returns `None` when any bit outside
+    /// [`PauseFlags::ALL`] is set, so a typo cannot silently pause nothing.
+    pub fn from_bits(bits: u32) -> Option<Self> {
+        if bits & !Self::ALL.0 == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
+    }
+
+    /// Union of two flag sets.
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// True when every flag in `other` is set in `self`.
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// True when at least one flag in `other` is set in `self`.
+    pub const fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    /// True when no flag is set.
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -321,6 +321,10 @@ pub enum DataKey {
     AccumulatedFee(Address),
     /// **Instance storage.** Granular pause level for creation vs emergency operations (Issue #767).
     PauseLevel,
+    /// **Instance storage.** Granular pause flags as `drip_common::pause::PauseFlags`
+    /// bits (Issue #975), written by `set_pause_flags`. Absent means no granular
+    /// flags are set. Layered on top of `PauseLevel`; see `pause::effective_flags`.
+    PauseFlags,
     /// **Instance storage.** Pending protocol fee update proposal under timelock (Issue #766).
     PendingFeeUpdate,
     /// **Instance storage.** Active protocol fee in basis points when set via timelocked execution (Issue #766).

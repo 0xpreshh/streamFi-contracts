@@ -87,7 +87,17 @@ pub enum RbacError {
 
 // ── Core helpers ──────────────────────────────────────────────────────────
 
-/// Role assignment tracking optional expiration timestamp (Issue #692).
+/// Stored value for a granted role (Issue #692, Issue #973).
+///
+/// `expires_at` is a ledger timestamp in seconds. From that timestamp on
+/// (`now >= expires_at`, compared with `env.ledger().timestamp()`) the grant no
+/// longer passes `has_role`, `require_role` or `require_role_or_admin`.
+/// `None` means the grant never expires.
+///
+/// Storage entries written without an expiry are treated as non-expiring. Legacy
+/// boolean entries from before this struct existed are read through the fallback
+/// branch of `has_role`. The storage key layout is unchanged, so no migration is
+/// needed for the key shape.
 #[soroban_sdk::contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RoleAssignment {
@@ -950,6 +960,226 @@ mod tests {
         });
     }
 
+    // ── expiration (issue #973) ──────────────────────────────────────────────
+
+    /// Grants `role` to `account`, expiring at `expires_at` (`None` = never).
+    fn grant_role_until(
+        env: &Env,
+        role: TestRole,
+        account: &Address,
+        is_admin: bool,
+        expires_at: Option<u64>,
+    ) -> bool {
+        grant_with_expiration(
+            env,
+            &role_key(role.clone(), account),
+            &ADMIN_COUNT,
+            &members_key(&role),
+            is_admin,
+            account,
+            expires_at,
+        )
+    }
+
+    #[test]
+    fn grant_without_expiry_never_expires() {
+        let env = Env::default();
+        let alice = Address::generate(&env);
+
+        in_contract(&env, || {
+            grant_role_until(&env, TestRole::Operator, &alice, false, None);
+            env.ledger().set_timestamp(u64::MAX - 1);
+            assert!(has_role(&env, &role_key(TestRole::Operator, &alice)));
+        });
+    }
+
+    #[test]
+    fn expiry_is_exclusive_at_the_exact_timestamp() {
+        let env = Env::default();
+        let alice = Address::generate(&env);
+
+        in_contract(&env, || {
+            env.ledger().set_timestamp(1_000);
+            grant_role_until(&env, TestRole::Operator, &alice, false, Some(1_100));
+
+            env.ledger().set_timestamp(1_099);
+            assert!(has_role(&env, &role_key(TestRole::Operator, &alice)));
+
+            // At expires_at the grant is already over.
+            env.ledger().set_timestamp(1_100);
+            assert!(!has_role(&env, &role_key(TestRole::Operator, &alice)));
+        });
+    }
+
+    #[test]
+    fn grant_with_past_expiry_is_never_active() {
+        let env = Env::default();
+        let alice = Address::generate(&env);
+
+        in_contract(&env, || {
+            env.ledger().set_timestamp(1_000);
+            grant_role_until(&env, TestRole::Operator, &alice, false, Some(999));
+            assert!(!has_role(&env, &role_key(TestRole::Operator, &alice)));
+        });
+    }
+
+    #[test]
+    fn unexpired_role_passes_require_role() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let operator = Address::generate(&env);
+
+        in_contract(&env, || {
+            env.ledger().set_timestamp(1_000);
+            grant_role_until(&env, TestRole::Operator, &operator, false, Some(1_050));
+            assert_eq!(
+                require_role(
+                    &env,
+                    &operator,
+                    &role_key(TestRole::Operator, &operator),
+                    None
+                ),
+                Ok(())
+            );
+        });
+    }
+
+    #[test]
+    fn expired_role_fails_require_role() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let operator = Address::generate(&env);
+
+        in_contract(&env, || {
+            env.ledger().set_timestamp(1_000);
+            grant_role_until(&env, TestRole::Operator, &operator, false, Some(1_050));
+            env.ledger().set_timestamp(1_050);
+            assert_eq!(
+                require_role(
+                    &env,
+                    &operator,
+                    &role_key(TestRole::Operator, &operator),
+                    None
+                ),
+                Err(RbacError::NotAuthorized)
+            );
+        });
+    }
+
+    #[test]
+    fn expired_admin_does_not_pass_require_role_or_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let root = Address::generate(&env);
+        let temp_admin = Address::generate(&env);
+
+        in_contract(&env, || {
+            env.ledger().set_timestamp(1_000);
+            grant_role_until(&env, TestRole::Admin, &root, true, None);
+            grant_role_until(&env, TestRole::Admin, &temp_admin, true, Some(1_050));
+            env.ledger().set_timestamp(1_050);
+
+            // The Admin super-user fallback must not be reachable with an expired grant.
+            assert_eq!(
+                require_role_or_admin(
+                    &env,
+                    &temp_admin,
+                    &role_key(TestRole::Operator, &temp_admin),
+                    &role_key(TestRole::Admin, &temp_admin),
+                    None,
+                ),
+                Err(RbacError::NotAuthorized)
+            );
+        });
+    }
+
+    #[test]
+    fn revoking_an_expired_role_clears_it_and_its_member_entry() {
+        let env = Env::default();
+        let alice = Address::generate(&env);
+
+        in_contract(&env, || {
+            env.ledger().set_timestamp(1_000);
+            grant_role_until(&env, TestRole::Operator, &alice, false, Some(1_050));
+            env.ledger().set_timestamp(1_050);
+
+            assert_eq!(
+                revoke_role(&env, TestRole::Operator, &alice, false),
+                Ok(true)
+            );
+            assert_eq!(
+                role_members(&env, &members_key(&TestRole::Operator)).len(),
+                0
+            );
+        });
+    }
+
+    #[test]
+    fn revoking_an_expired_admin_decrements_the_admin_count() {
+        let env = Env::default();
+        let root = Address::generate(&env);
+        let temp_admin = Address::generate(&env);
+
+        in_contract(&env, || {
+            env.ledger().set_timestamp(1_000);
+            grant_role_until(&env, TestRole::Admin, &root, true, None);
+            grant_role_until(&env, TestRole::Admin, &temp_admin, true, Some(1_050));
+            assert_eq!(admin_count(&env, &ADMIN_COUNT), 2);
+
+            env.ledger().set_timestamp(1_050);
+            assert_eq!(revoke_role(&env, TestRole::Admin, &temp_admin, true), Ok(true));
+            assert_eq!(admin_count(&env, &ADMIN_COUNT), 1);
+            assert!(has_role(&env, &role_key(TestRole::Admin, &root)));
+        });
+    }
+
+    #[test]
+    fn renewing_an_expired_admin_does_not_double_count() {
+        let env = Env::default();
+        let root = Address::generate(&env);
+        let temp_admin = Address::generate(&env);
+
+        in_contract(&env, || {
+            env.ledger().set_timestamp(1_000);
+            grant_role_until(&env, TestRole::Admin, &root, true, None);
+            grant_role_until(&env, TestRole::Admin, &temp_admin, true, Some(1_050));
+
+            env.ledger().set_timestamp(1_050);
+            grant_role_until(&env, TestRole::Admin, &temp_admin, true, Some(2_000));
+            assert_eq!(admin_count(&env, &ADMIN_COUNT), 2);
+            assert!(has_role(&env, &role_key(TestRole::Admin, &temp_admin)));
+            assert_eq!(
+                role_members(&env, &members_key(&TestRole::Admin)).len(),
+                2
+            );
+        });
+    }
+
+    /// Known gap: `AdminCount` is only decremented on revoke, so an Admin whose
+    /// grant has expired still counts toward the LastAdmin guard. Here the only
+    /// active admin can be revoked and governance is left with no active admin.
+    /// Fixing this needs the guard to count active admins (for example via the
+    /// governor's `role_members`, which already filters by `has_role`).
+    #[test]
+    #[ignore = "known gap (issue #973): expired Admin still counted by the LastAdmin guard"]
+    fn last_active_admin_cannot_be_revoked_while_another_admin_has_expired() {
+        let env = Env::default();
+        let root = Address::generate(&env);
+        let temp_admin = Address::generate(&env);
+
+        in_contract(&env, || {
+            env.ledger().set_timestamp(1_000);
+            grant_role_until(&env, TestRole::Admin, &root, true, None);
+            grant_role_until(&env, TestRole::Admin, &temp_admin, true, Some(1_050));
+
+            env.ledger().set_timestamp(1_050);
+            assert_eq!(
+                revoke_role(&env, TestRole::Admin, &root, true),
+                Err(RbacError::LastAdmin)
+            );
+        });
+    }
+
     // ── multi-admin guards ────────────────────────────────────────────────────
 
     #[test]
@@ -1004,3 +1234,45 @@ mod tests {
         });
     }
 }
+===NOTES
+{"message":"Not Found","documentation_url":"https://docs.github.com/rest/repos/contents#get-repository-content","status":"404"}gh: Not Found (HTTP 404)
+===GREP
+Cargo.toml
+contracts/batch-processor/Cargo.toml
+contracts/common/Cargo.toml
+contracts/common/src
+contracts/common/src/lib.rs
+contracts/common/src/pause.rs
+contracts/common/src/rbac.rs
+contracts/common/src/testutils.rs
+contracts/common/src/ttl.rs
+contracts/factory/Cargo.toml
+contracts/governor/Cargo.toml
+contracts/governor/src
+contracts/governor/src/config.rs
+contracts/governor/src/errors.rs
+contracts/governor/src/events.rs
+contracts/governor/src/lib.rs
+contracts/governor/src/role.rs
+contracts/governor/src/storage.rs
+contracts/governor/src/tests.rs
+contracts/governor/src/ttl.rs
+contracts/oracle/Cargo.toml
+contracts/stream/Cargo.toml
+contracts/token-vault/Cargo.toml
+tests/audit_round_2_regression.rs
+tests/batch_transfer_processor.rs
+tests/factory_batch_cancel.rs
+tests/factory_batch_create.rs
+tests/factory_deploy.rs
+tests/factory_pause.rs
+tests/factory_ttl.rs
+tests/gas_snapshot.rs
+tests/governor_config.rs
+tests/governor_rbac.rs
+tests/oracle_stress_test.rs
+tests/reentrancy_stress_test.rs
+tests/stream_clawback.rs
+tests/stream_lifecycle.rs
+tests/stream_pause_resume.rs
+tests/yield_rebate.rs

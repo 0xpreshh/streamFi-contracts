@@ -18,6 +18,7 @@ use soroban_sdk::{
 };
 
 use drip_common::is_zero_address;
+use drip_common::pause::PauseFlags;
 
 pub use errors::Error;
 pub use governance::{FeeUpdateProposal, WasmVersionInfo};
@@ -1200,6 +1201,33 @@ impl DripFactory {
         // confirm creation resumed (see `events::unpaused`).
         events::unpaused(&env, &governor, env.ledger().timestamp());
         Ok(())
+    }
+
+    /// Governor-only: sets the granular pause flags (Issue #975).
+    ///
+    /// `flags` is a `PauseFlags` bitfield (`PAUSE_DEPOSITS = 1`,
+    /// `PAUSE_WITHDRAWALS = 2`, `PAUSE_CREATIONS = 4`). Passing `0` clears the
+    /// overlay. Clearing it never lifts a global `pause`. Bits outside the
+    /// defined set are rejected with `InvalidPauseFlags`.
+    pub fn set_pause_flags(env: Env, flags: u32) -> Result<(), Error> {
+        let governor: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::GovernorAddress)
+            .ok_or(Error::NotInitialized)?;
+        governor.require_auth();
+        let parsed = PauseFlags::from_bits(flags).ok_or(Error::InvalidPauseFlags)?;
+        ttl::bump_instance(&env);
+        pause::set_granular_flags(&env, parsed);
+        Ok(())
+    }
+
+    /// Read-only: every pause flag currently in effect, as `PauseFlags` bits.
+    ///
+    /// Includes the footprint of the global level (`pause` gives all three
+    /// bits, `pause_with_level(CreationOnly)` gives deposits and creations).
+    pub fn pause_flags(env: Env) -> u32 {
+        pause::effective_flags(&env).bits()
     }
 
     /// Read-only: whether the factory is currently under an emergency pause.

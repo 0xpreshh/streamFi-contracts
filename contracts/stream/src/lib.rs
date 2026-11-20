@@ -2393,7 +2393,7 @@ impl DripStream {
             return Err(Error::InvalidAmount);
         }
         if cliff_time < info.start_time || (info.end_time > 0 && cliff_time > info.end_time) {
-            return Err(Error::InvalidTimeRange);
+            return Err(Error::InvalidCliffDuration);
         }
 
         let cfg = CliffConfig {

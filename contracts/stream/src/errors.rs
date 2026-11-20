@@ -56,4 +56,10 @@ pub enum Error {
     StreamAlreadyCompleted = 34,
     /// The optional creation-time metadata URI exceeds 128 bytes (Issue #923).
     MetadataUriTooLong = 35,
+    /// `pause` was called on a stream that is already paused (#946).
+    StreamAlreadyPaused = 120,
+    /// `resume` was called on a stream that is not paused (#946).
+    StreamNotPaused = 121,
+    /// The caller is not an approved funder for this stream (#933).
+    FunderNotApproved = 122,
 }

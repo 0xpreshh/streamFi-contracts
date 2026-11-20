@@ -4511,6 +4511,30 @@ mod tests {
     }
 
     #[test]
+    fn gradual_decline_passes_the_breaker_but_the_same_move_in_one_jump_does_not() {
+        let (env, client, admin) = setup();
+        client.initialize(&admin);
+        let feeder = Address::generate(&env);
+        client.grant_role(&admin, &Role::PriceFeeder, &feeder);
+        client.configure_oracle(&admin, &volatility_config());
+        client.submit_price(&feeder, &100_000_000);
+        client.set_max_deviation_bps(&admin, &1000);
+
+        // 27.1% in one update is far over the 10% breaker.
+        assert_eq!(
+            client.try_submit_price(&feeder, &72_900_000),
+            Err(Ok(Error::ExcessivePriceDeviation))
+        );
+
+        // The same total move in three steps of exactly 10% each is accepted,
+        // because every update is compared with the previous accepted price.
+        for price in [90_000_000u64, 81_000_000, 72_900_000] {
+            assert!(client.try_submit_price(&feeder, &price).is_ok());
+        }
+        assert_eq!(client.latest_price().price, 72_900_000);
+    }
+
+    #[test]
     fn test_fallback_oracle_feed_automatic_failover() {
         let (env, client, admin) = setup();
         client.initialize(&admin);

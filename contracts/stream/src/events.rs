@@ -396,3 +396,43 @@ pub fn stream_completed(env: &Env, recipient: &Address, total_withdrawn: i128) {
         total_withdrawn,
     );
 }
+
+/// Emitted when a stream enters the paused state (#935).
+///
+/// Topics: `("StreamPaused", stream_id)` where `stream_id` is this contract's address.
+/// Data:   `paused_at`
+pub fn stream_paused(env: &Env, paused_at: u64) {
+    env.events().publish(
+        (Symbol::new(env, "StreamPaused"), env.current_contract_address()),
+        paused_at,
+    );
+}
+
+/// Emitted when a paused stream is resumed (#935).
+///
+/// Topics: `("StreamResumed", stream_id)` where `stream_id` is this contract's address.
+/// Data:   `resumed_at`
+pub fn stream_resumed(env: &Env, resumed_at: u64) {
+    env.events().publish(
+        (Symbol::new(env, "StreamResumed"), env.current_contract_address()),
+        resumed_at,
+    );
+}
+
+/// Emitted when the sender approves a third-party funder (#933).
+pub fn funder_approved(env: &Env, sender: &Address, funder: &Address) {
+    let sequence = next_sequence(env);
+    env.events().publish(
+        (symbol_short!("fund_appr"), sender.clone(), sequence),
+        funder.clone(),
+    );
+}
+
+/// Emitted when the sender revokes a third-party funder approval (#933).
+pub fn funder_revoked(env: &Env, sender: &Address, funder: &Address) {
+    let sequence = next_sequence(env);
+    env.events().publish(
+        (symbol_short!("fund_rvk"), sender.clone(), sequence),
+        funder.clone(),
+    );
+}

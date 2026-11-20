@@ -9,14 +9,14 @@ pub mod storage;
 mod tests;
 mod ttl;
 
-use soroban_sdk::{contract, contractimpl, panic_with_error, token, Address, Env, String};
+use soroban_sdk::{contract, contractimpl, panic_with_error, token, Address, Env, String, Symbol};
 
 use drip_common::{is_zero_address, pause};
 
 pub use errors::Error;
 pub use storage::{
-    CancelledStreamRecord, CliffConfig, SplitConfig, StreamConfig, StreamKeeperRewardPool,
-    StreamStatus, StreamSummary,
+    CancelDelegateConfig, CancelledStreamRecord, CliffConfig, SplitConfig, StreamConfig,
+    StreamKeeperRewardPool, StreamStatus, StreamSummary,
 };
 use storage::{
     DataKey, RateCheckpoint, StreamInfo, FLAG_CLAWBACK_ENABLED, FLAG_PAUSED, FLAG_REGULATED_ASSET,
@@ -85,6 +85,36 @@ fn require_sender_or_operator(env: &Env, caller: &Address, sender: &Address) -> 
             }
         }
     }
+}
+
+/// Check that `caller` is authorized to cancel the stream: either the `sender`,
+/// the delegated `operator`, or an unexpired emergency `CancelDelegate` (#886).
+fn require_cancel_authorized(env: &Env, caller: &Address, sender: &Address) -> Result<(), Error> {
+    if caller == sender {
+        caller.require_auth();
+        return Ok(());
+    }
+    if let Some(op) = env
+        .storage()
+        .instance()
+        .get::<_, Address>(&DataKey::Operator)
+    {
+        if caller == &op {
+            caller.require_auth();
+            return Ok(());
+        }
+    }
+    if let Some(delegate_cfg) = env
+        .storage()
+        .instance()
+        .get::<_, CancelDelegateConfig>(&DataKey::CancelDelegate)
+    {
+        if caller == &delegate_cfg.delegate && env.ledger().timestamp() <= delegate_cfg.expires_at {
+            caller.require_auth();
+            return Ok(());
+        }
+    }
+    Err(Error::NotAuthorized)
 }
 
 fn auto_forward_address(env: &Env, recipient: &Address) -> Address {
@@ -579,7 +609,7 @@ impl DripStream {
             }
         }
 
-        require_sender_or_operator(env, caller, &info.sender)?;
+        require_cancel_authorized(env, caller, &info.sender)?;
 
         let tk = token::Client::new(env, &info.token);
         let contract_addr = env.current_contract_address();
@@ -2509,5 +2539,103 @@ impl DripStream {
     /// Read-only / maintenance alias for `extend_stream_ttl` (Issue #805).
     pub fn extend_ttl(env: Env) -> Result<(), Error> {
         Self::extend_stream_ttl(env)
+    }
+
+    /// Emergency keeper renewal with caller-specified TTL thresholds and sanity bounds (Issue #887).
+    pub fn emergency_extend_ttl_custom(
+        env: Env,
+        min_ledgers_to_live: u32,
+        ledgers_to_extend: u32,
+    ) -> Result<(), Error> {
+        let _info = state::try_load(&env)?;
+        ttl::emergency_extend_custom(&env, min_ledgers_to_live, ledgers_to_extend)
+    }
+
+    /// Estimated ledger sequence at which this stream ends, used by the batch
+    /// processor for adaptive TTL bumping (Issue #889).
+    pub fn expiration_ledger(env: Env) -> u32 {
+        let current_ledger = env.ledger().sequence();
+        if let Ok(info) = state::try_load(&env) {
+            if info.end_time > 0 {
+                let remaining_secs = info.end_time.saturating_sub(env.ledger().timestamp());
+                let remaining_ledgers = remaining_secs
+                    .div_ceil(ttl::SECONDS_PER_LEDGER)
+                    .min(ttl::MAX_TTL_LEDGERS as u64) as u32;
+                return current_ledger.saturating_add(remaining_ledgers);
+            }
+        }
+        current_ledger
+    }
+
+    /// Configure a time-bounded emergency cancellation delegate for bulk
+    /// account-wide cancellations (Issue #886). Sender-only.
+    ///
+    /// The delegate may invoke `cancel` / `cancel_with_reason` (including via
+    /// `BatchTransferProcessor::batch_cancel`) until `expires_at`, but cannot
+    /// invoke any other sender-privileged action (`pause`, `top_up`, `clawback`, etc.).
+    pub fn set_cancel_delegate(
+        env: Env,
+        caller: Address,
+        delegate: Address,
+        expires_at: u64,
+    ) -> Result<(), Error> {
+        let info = state::try_load(&env)?;
+        if caller != info.sender {
+            return Err(Error::NotAuthorized);
+        }
+        caller.require_auth();
+        if is_zero_address(&env, &delegate) {
+            return Err(Error::InvalidRecipient);
+        }
+        if expires_at <= env.ledger().timestamp() {
+            return Err(Error::InvalidTimeRange);
+        }
+
+        ttl::bump(&env);
+        let cfg = CancelDelegateConfig {
+            delegate: delegate.clone(),
+            expires_at,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::CancelDelegate, &cfg);
+        env.events().publish(
+            (Symbol::new(&env, "cancel_delegate_set"), caller),
+            (delegate, expires_at),
+        );
+        Ok(())
+    }
+
+    /// Revoke the configured emergency cancellation delegate (Issue #886). Sender-only.
+    pub fn revoke_cancel_delegate(env: Env, caller: Address) -> Result<(), Error> {
+        let info = state::try_load(&env)?;
+        if caller != info.sender {
+            return Err(Error::NotAuthorized);
+        }
+        caller.require_auth();
+
+        ttl::bump(&env);
+        env.storage().instance().remove(&DataKey::CancelDelegate);
+        env.events().publish(
+            (Symbol::new(&env, "cancel_delegate_revoked"), caller),
+            env.ledger().timestamp(),
+        );
+        Ok(())
+    }
+
+    /// Returns the configured emergency cancellation delegate, if any (Issue #886).
+    pub fn cancel_delegate(env: Env) -> Option<CancelDelegateConfig> {
+        env.storage().instance().get(&DataKey::CancelDelegate)
+    }
+
+    /// Returns `true` when `caller` is the active (unexpired) emergency
+    /// cancellation delegate for this stream (Issue #886).
+    pub fn can_cancel_as_delegate(env: Env, caller: Address) -> bool {
+        env.storage()
+            .instance()
+            .get::<_, CancelDelegateConfig>(&DataKey::CancelDelegate)
+            .is_some_and(|cfg| {
+                cfg.delegate == caller && env.ledger().timestamp() <= cfg.expires_at
+            })
     }
 }

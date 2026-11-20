@@ -3569,6 +3569,7 @@ fn resume_emits_stream_resumed_event() {
     assert!(has_event_named(&s.env, "StreamResumed"));
 }
 
+
 #[test]
 fn rejected_double_pause_emits_no_stream_paused_event() {
     let s = Setup::new(100, 3_600, false);
@@ -3663,4 +3664,111 @@ fn rejected_resume_then_pause_retry_emits_events_once_each() {
     assert!(has_event_named(&s.env, "StreamPaused"));
     s.client.resume(&s.sender);
     assert!(has_event_named(&s.env, "StreamResumed"));
+}
+
+// ---- #887: custom TTL thresholds on emergency keeper renewal ----
+
+#[test]
+fn emergency_extend_ttl_custom_validates_bounds_and_extends() {
+    let s = Setup::new(100, 3_600, false);
+
+    // Zero min or extend rejected
+    assert_eq!(
+        s.client.try_emergency_extend_ttl_custom(&0, &100_000),
+        Err(Ok(Error::InvalidAmount))
+    );
+    assert_eq!(
+        s.client.try_emergency_extend_ttl_custom(&10_000, &0),
+        Err(Ok(Error::InvalidAmount))
+    );
+    // min > extend rejected
+    assert_eq!(
+        s.client.try_emergency_extend_ttl_custom(&200_000, &100_000),
+        Err(Ok(Error::InvalidAmount))
+    );
+    // extend > MAX_TTL_LEDGERS rejected
+    assert_eq!(
+        s.client
+            .try_emergency_extend_ttl_custom(&50_000, &(crate::ttl::MAX_TTL_LEDGERS + 1)),
+        Err(Ok(Error::InvalidAmount))
+    );
+
+    // Valid custom bounds (threshold above current 200_000 TTL) extend instance TTL to 350_000
+    assert_eq!(
+        s.client.try_emergency_extend_ttl_custom(&250_000, &350_000),
+        Ok(Ok(()))
+    );
+    let ttl = s
+        .env
+        .as_contract(&s.client.address, || s.env.storage().instance().get_ttl());
+    assert_eq!(ttl, 350_000);
+}
+
+// ---- #886: time-bounded emergency cancellation delegate ----
+
+#[test]
+fn cancel_delegate_allows_cancellation_within_window_only() {
+    let s = Setup::new(10, 3_600, false);
+    let delegate = Address::generate(&s.env);
+    let stranger = Address::generate(&s.env);
+    let now = s.env.ledger().timestamp();
+
+    // Non-sender cannot configure delegate
+    assert_eq!(
+        s.client
+            .try_set_cancel_delegate(&stranger, &delegate, &(now + 500)),
+        Err(Ok(Error::NotAuthorized))
+    );
+    // Expired timestamp rejected
+    assert_eq!(
+        s.client.try_set_cancel_delegate(&s.sender, &delegate, &now),
+        Err(Ok(Error::InvalidTimeRange))
+    );
+
+    // Sender configures delegate valid until now + 500
+    s.client
+        .set_cancel_delegate(&s.sender, &delegate, &(now + 500));
+    assert!(s.client.can_cancel_as_delegate(&delegate));
+    assert!(!s.client.can_cancel_as_delegate(&stranger));
+
+    // Cancel delegate CANNOT invoke other privileged sender actions (e.g. pause)
+    assert_eq!(
+        s.client.try_pause(&delegate),
+        Err(Ok(Error::NotAuthorized))
+    );
+
+    // Delegate CAN cancel while within window
+    s.client.cancel(&delegate);
+    assert!(s.client.info().is_cancelled());
+}
+
+#[test]
+fn expired_or_revoked_cancel_delegate_cannot_cancel() {
+    let s = Setup::new(10, 3_600, false);
+    let delegate = Address::generate(&s.env);
+    let now = s.env.ledger().timestamp();
+
+    s.client
+        .set_cancel_delegate(&s.sender, &delegate, &(now + 100));
+    assert!(s.client.can_cancel_as_delegate(&delegate));
+
+    // Advance past expiration -> delegate is no longer authorized
+    s.advance_secs(101);
+    assert!(!s.client.can_cancel_as_delegate(&delegate));
+    assert_eq!(
+        s.client.try_cancel(&delegate),
+        Err(Ok(Error::NotAuthorized))
+    );
+
+    // Re-grant and then explicitly revoke -> also rejected
+    let now2 = s.env.ledger().timestamp();
+    s.client
+        .set_cancel_delegate(&s.sender, &delegate, &(now2 + 500));
+    assert!(s.client.can_cancel_as_delegate(&delegate));
+    s.client.revoke_cancel_delegate(&s.sender);
+    assert!(!s.client.can_cancel_as_delegate(&delegate));
+    assert_eq!(
+        s.client.try_cancel(&delegate),
+        Err(Ok(Error::NotAuthorized))
+    );
 }

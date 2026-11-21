@@ -64,4 +64,7 @@ pub enum Error {
     StreamNotPaused = 121,
     /// The caller is not an approved funder for this stream (#933).
     FunderNotApproved = 122,
+    /// `bump_long_term_stream_ttl` was called on a stream that is not an
+    /// active multi-year schedule (#880).
+    StreamNotLongTerm = 123,
 }

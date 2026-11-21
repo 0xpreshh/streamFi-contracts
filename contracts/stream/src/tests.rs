@@ -8,7 +8,7 @@ use std::boxed::Box;
 use soroban_sdk::{
     symbol_short,
     testutils::{storage::Instance as _, Address as _, Events as _, Ledger, LedgerInfo},
-    token, Address, Env, IntoVal, String, TryIntoVal,
+    token, Address, Env, IntoVal, String, Symbol, TryFromVal, TryIntoVal,
 };
 
 use crate::{
@@ -1409,20 +1409,21 @@ fn top_up_and_extend_updates_balance_and_end_time() {
     assert_eq!(contract_after, contract_before + 20_000);
 
     // The atomic operation emits one dedicated event rather than a generic
-    // top-up event plus a separate duration event that indexers must correlate.
-    assert_eq!(s.client.event_sequence(), 2);
+    // top-up event plus a separate duration event that indexers must correlate,
+    // followed by the explicit `StreamTopUpExtended` schedule event (#881).
+    assert_eq!(s.client.event_sequence(), 3);
     let all_events = s.env.events().all();
     let stream_events: std::vec::Vec<_> = all_events
         .iter()
         .filter(|(contract, _, _)| contract == &s.client.address)
         .collect();
-    assert_eq!(stream_events.len(), 2);
-    let last = stream_events.last().unwrap();
+    assert_eq!(stream_events.len(), 3);
+    let top_ext = &stream_events[1];
     assert_eq!(
-        last.1,
+        top_ext.1,
         (symbol_short!("top_ext"), s.sender.clone(), 2_u64).into_val(&s.env)
     );
-    let data: (i128, i128, u64, u64) = last.2.try_into_val(&s.env).unwrap();
+    let data: (i128, i128, u64, u64) = top_ext.2.try_into_val(&s.env).unwrap();
     assert_eq!(
         data,
         (
@@ -3773,6 +3774,208 @@ fn expired_or_revoked_cancel_delegate_cannot_cancel() {
     );
 }
 
+// ── Issue #881: StreamTopUpExtended event ───────────────────────────────────
+
+fn stream_events(
+    s: &Setup,
+) -> std::vec::Vec<(soroban_sdk::Vec<soroban_sdk::Val>, soroban_sdk::Val)> {
+    s.env
+        .events()
+        .all()
+        .iter()
+        .filter(|(contract, _, _)| contract == &s.client.address)
+        .map(|(_, topics, data)| (topics, data))
+        .collect()
+}
+
+fn has_topic(s: &Setup, name: &str) -> bool {
+    let wanted = Symbol::new(&s.env, name);
+    stream_events(s).iter().any(|(topics, _)| {
+        topics
+            .get(0)
+            .and_then(|t| Symbol::try_from_val(&s.env, &t).ok())
+            .is_some_and(|t| t == wanted)
+    })
+}
+
+#[test]
+fn top_up_and_extend_emits_stream_top_up_extended() {
+    let s = Setup::new(100, 3_600, false);
+    let before_end = s.client.info().end_time;
+    let deposited_before = s.client.cumulative_deposited();
+    token::StellarAssetClient::new(&s.env, &s.token.address).mint(&s.sender, &20_000);
+
+    s.client.top_up_and_extend(&s.sender, &20_000, &200);
+
+    let (topics, data) = stream_events(&s).pop().unwrap();
+    assert_eq!(
+        topics,
+        (
+            Symbol::new(&s.env, "StreamTopUpExtended"),
+            s.sender.clone(),
+            3_u64
+        )
+            .into_val(&s.env)
+    );
+    let payload: (u64, u64, i128, i128) = data.try_into_val(&s.env).unwrap();
+    assert_eq!(
+        payload,
+        (
+            before_end,
+            before_end + 200,
+            20_000,
+            deposited_before + 20_000
+        )
+    );
+}
+
+#[test]
+fn plain_top_up_does_not_emit_stream_top_up_extended() {
+    let s = Setup::new(100, 3_600, false);
+    token::StellarAssetClient::new(&s.env, &s.token.address).mint(&s.sender, &5_000);
+
+    s.client.top_up(&s.sender, &5_000);
+
+    assert!(!has_topic(&s, "StreamTopUpExtended"));
+}
+
+// ── Issue #880: long-term stream TTL heartbeat ──────────────────────────────
+
+const YEAR_SECS: u64 = 31_536_000;
+
+fn instance_ttl(s: &Setup) -> u32 {
+    s.env
+        .as_contract(&s.client.address, || s.env.storage().instance().get_ttl())
+}
+
+#[test]
+fn heartbeat_extends_ttl_of_multi_year_stream() {
+    let s = Setup::new(1, 4 * YEAR_SECS, false);
+    s.env.ledger().with_mut(|l| l.sequence_number += 1_000_000);
+    let before = instance_ttl(&s);
+    assert!(before < 6_000_000);
+
+    s.client.bump_long_term_stream_ttl(&6_000_000, &6_000_000);
+
+    let after = instance_ttl(&s);
+    assert!(after > before);
+    assert!(after >= 6_000_000);
+}
+
+#[test]
+fn heartbeat_rejects_short_streams() {
+    let s = Setup::new(10, 3_600, false);
+    assert_eq!(
+        s.client.try_bump_long_term_stream_ttl(&1_000, &100_000),
+        Err(Ok(Error::StreamNotLongTerm))
+    );
+}
+
+#[test]
+fn heartbeat_rejects_ended_streams() {
+    let s = Setup::new(1, 2 * YEAR_SECS, false);
+    s.advance_secs(2 * YEAR_SECS);
+    assert_eq!(
+        s.client.try_bump_long_term_stream_ttl(&1_000, &100_000),
+        Err(Ok(Error::StreamNotLongTerm))
+    );
+}
+
+#[test]
+fn heartbeat_rejects_invalid_bounds() {
+    let s = Setup::new(1, 2 * YEAR_SECS, false);
+    for (threshold, bump) in [(0, 100), (100, 0), (200, 100), (1, 6_312_001)] {
+        assert_eq!(
+            s.client.try_bump_long_term_stream_ttl(&threshold, &bump),
+            Err(Ok(Error::InvalidAmount))
+        );
+    }
+}
+
+// ── Issue #878: delegated claims ────────────────────────────────────────────
+
+#[test]
+fn delegate_claims_for_recipient_without_taking_custody() {
+    let s = Setup::new(10, 3_600, false);
+    let delegate = Address::generate(&s.env);
+    s.client.set_claim_delegate(&delegate);
+    assert_eq!(s.client.claim_delegate(), Some(delegate.clone()));
+
+    s.advance_secs(100);
+    let claimed = s.client.claim_for(&delegate, &s.recipient, &500);
+
+    assert_eq!(claimed, 500);
+    assert_eq!(s.env.auths()[0].0, delegate);
+    assert_eq!(s.token.balance(&s.recipient), 500);
+    assert_eq!(s.token.balance(&delegate), 0);
+    assert_eq!(s.client.info().withdrawn, 500);
+    assert!(has_topic(&s, "claim_for"));
+}
+
+#[test]
+fn claim_for_requires_a_grant_from_the_recipient() {
+    let s = Setup::new(10, 3_600, false);
+    let delegate = Address::generate(&s.env);
+    s.advance_secs(100);
+
+    assert_eq!(
+        s.client.try_claim_for(&delegate, &s.recipient, &100),
+        Err(Ok(Error::NotAuthorized))
+    );
+}
+
+#[test]
+fn claim_for_rejects_a_recipient_that_does_not_match() {
+    let s = Setup::new(10, 3_600, false);
+    let delegate = Address::generate(&s.env);
+    let other = Address::generate(&s.env);
+    s.client.set_claim_delegate(&delegate);
+    s.advance_secs(100);
+
+    assert_eq!(
+        s.client.try_claim_for(&delegate, &other, &100),
+        Err(Ok(Error::NotAuthorized))
+    );
+}
+
+#[test]
+fn revoked_delegate_cannot_claim() {
+    let s = Setup::new(10, 3_600, false);
+    let delegate = Address::generate(&s.env);
+    s.client.set_claim_delegate(&delegate);
+    s.client.revoke_claim_delegate();
+    s.advance_secs(100);
+
+    assert_eq!(s.client.claim_delegate(), None);
+    assert_eq!(
+        s.client.try_claim_for(&delegate, &s.recipient, &100),
+        Err(Ok(Error::NotAuthorized))
+    );
+}
+
+#[test]
+fn claim_grant_does_not_carry_over_to_a_new_recipient() {
+    let s = Setup::new(10, 3_600, false);
+    let delegate = Address::generate(&s.env);
+    let new_recipient = Address::generate(&s.env);
+    s.client.set_claim_delegate(&delegate);
+    s.client.transfer_recipient(&new_recipient);
+    s.advance_secs(100);
+
+    assert_eq!(s.client.claim_delegate(), None);
+    assert_eq!(
+        s.client.try_claim_for(&delegate, &new_recipient, &100),
+        Err(Ok(Error::NotAuthorized))
+    );
+}
+
+#[test]
+fn recipient_cannot_be_its_own_claim_delegate() {
+    let s = Setup::new(10, 3_600, false);
+    assert_eq!(
+        s.client.try_set_claim_delegate(&s.recipient),
+        Err(Ok(Error::InvalidRecipient))
+    );
 
 // ---------------------------------------------------------------------------
 // Compact StreamFlags bitfield (#882)

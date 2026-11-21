@@ -57,6 +57,8 @@ pub enum Error {
     InsufficientVaultLiquidity = 27,
     /// Deposit amount is below the configured minimum deposit amount for this asset (Issue #756).
     DepositBelowMin = 28,
+    /// `sweep_to_strategy` targeted a strategy vault governance has not approved (Issue #893).
+    StrategyNotApproved = 29,
     /// No untracked token excess is available for emergency recovery (#948).
-    NothingToSweep = 29,
+    NothingToSweep = 30,
 }

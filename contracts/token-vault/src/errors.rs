@@ -59,4 +59,6 @@ pub enum Error {
     DepositBelowMin = 28,
     /// `sweep_to_strategy` targeted a strategy vault governance has not approved (Issue #893).
     StrategyNotApproved = 29,
+    /// No untracked token excess is available for emergency recovery (#948).
+    NothingToSweep = 30,
 }

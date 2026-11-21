@@ -21,7 +21,7 @@ pub const FLAG_REGULATED_ASSET: u32 = 1 << 3;
 pub const CURRENT_STORAGE_VERSION: u32 = 1;
 
 #[contracttype]
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum DataKey {
     /// Single-key representation of all stream fields.
     /// Consolidates all stream metadata into one storage read instead of eleven
@@ -259,6 +259,14 @@ impl StreamInfo {
     /// Mark the stream as using a regulated asset, setting the correct flag bit (Issue #781).
     pub fn mark_regulated_asset(&mut self) {
         self.flags |= FLAG_REGULATED_ASSET;
+    }
+
+    /// Explicit cumulative payout counter (Issue #936).
+    ///
+    /// `withdrawn` is persisted independently from the contract's live token
+    /// balance; exposing it by name avoids reconstructing historical events.
+    pub fn total_withdrawn(&self) -> i128 {
+        self.withdrawn
     }
 
     /// True when all deposited stream funds have been completely withdrawn or stream is ended and fully drained (Issue #753).

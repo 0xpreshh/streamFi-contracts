@@ -56,6 +56,8 @@ pub enum Error {
     StreamAlreadyCompleted = 34,
     /// The optional creation-time metadata URI exceeds 128 bytes (Issue #923).
     MetadataUriTooLong = 35,
+    /// Cliff timestamp is before `start_time` or after `end_time` (Issue #884).
+    InvalidCliffDuration = 36,
     /// `pause` was called on a stream that is already paused (#946).
     StreamAlreadyPaused = 120,
     /// `resume` was called on a stream that is not paused (#946).

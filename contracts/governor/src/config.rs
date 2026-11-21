@@ -76,6 +76,32 @@ pub fn set_voting_period(env: &Env, voting_period_ledgers: u32) -> Result<(), Er
     Ok(())
 }
 
+/// #1012: Validate quorum percentage boundaries during governance initialization.
+/// Quorum must be in [0, 10_000] (0% to 100%) and voting period must be
+/// at least MIN_VOTING_PERIOD_LEDGERS. Rejects unworkable configs like
+/// >100% quorum or a 0-ledger voting period.
+pub fn validate_config_bounds(
+    min_quorum_bps: u32,
+    voting_period_ledgers: u32,
+) -> Result<(), Error> {
+    if min_quorum_bps > 10_000 {
+        return Err(Error::InvalidParam);
+    }
+    if voting_period_ledgers < MIN_VOTING_PERIOD_LEDGERS {
+        return Err(Error::InvalidParam);
+    }
+    Ok(())
+}
+
+/// #1012: Validate and set the quorum threshold.
+pub fn set_quorum(env: &Env, min_quorum_bps: u32) -> Result<(), Error> {
+    validate_config_bounds(min_quorum_bps, get_voting_period(env))?;
+    env.storage()
+        .instance()
+        .set(&DataKey::MinQuorumBps, &min_quorum_bps);
+    Ok(())
+}
+
 /// Get the current voting period in ledgers.
 pub fn get_voting_period(env: &Env) -> u32 {
     env.storage()

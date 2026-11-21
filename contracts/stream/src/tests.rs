@@ -3772,3 +3772,216 @@ fn expired_or_revoked_cancel_delegate_cannot_cancel() {
         Err(Ok(Error::NotAuthorized))
     );
 }
+
+
+// ---------------------------------------------------------------------------
+// Compact StreamFlags bitfield (#882)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn stream_flags_bitfield_getters_setters_and_persistent_roundtrip() {
+    use crate::storage::{get_status_flags, set_status_flags, StreamFlags};
+
+    let mut flags = StreamFlags::new();
+    assert_eq!(flags.bits(), 0);
+    assert!(!flags.is_paused());
+    assert!(!flags.is_cliff_claimed());
+    assert!(!flags.is_cancelled());
+    assert!(!flags.is_depleted());
+
+    flags.set_paused(true);
+    flags.set_cliff_claimed(true);
+    assert!(flags.is_paused());
+    assert!(flags.is_cliff_claimed());
+    assert!(!flags.is_cancelled());
+    assert!(!flags.is_depleted());
+
+    flags.set_cancelled(true);
+    flags.set_depleted(true);
+    flags.set_paused(false);
+    assert!(!flags.is_paused());
+    assert!(flags.is_cliff_claimed());
+    assert!(flags.is_cancelled());
+    assert!(flags.is_depleted());
+    assert_eq!(
+        flags.bits(),
+        StreamFlags::CLIFF_CLAIMED | StreamFlags::CANCELLED | StreamFlags::DEPLETED
+    );
+
+    let s = Setup::new(100, 3600, false);
+    s.env.as_contract(&s.client.address, || {
+        assert_eq!(get_status_flags(&s.env), StreamFlags::new());
+        set_status_flags(&s.env, flags);
+        assert_eq!(get_status_flags(&s.env), flags);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Non-linear vesting curves (#883)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn vesting_curve_linear_exponential_decay_and_stepped_invariants() {
+    use crate::state::{get_vesting_curve, set_vesting_curve, vested_amount_for_curve, VestingCurve};
+
+    let total: i128 = 1_000_000;
+    let duration: u64 = 1_000;
+
+    let lin_mid = vested_amount_for_curve(&VestingCurve::Linear, total, 500, duration).unwrap();
+    assert_eq!(lin_mid, 500_000);
+
+    // Exponential decay front-loads more value by the midpoint than linear vesting.
+    let exp_curve = VestingCurve::ExponentialDecay(5_000);
+    let exp_start = vested_amount_for_curve(&exp_curve, total, 0, duration).unwrap();
+    let exp_mid = vested_amount_for_curve(&exp_curve, total, 500, duration).unwrap();
+    let exp_end = vested_amount_for_curve(&exp_curve, total, duration, duration).unwrap();
+    assert_eq!(exp_start, 0);
+    assert!(exp_mid > lin_mid && exp_mid < total);
+    assert_eq!(exp_end, total);
+
+    // Stepped vesting unlocks in discrete 250-second chunks.
+    let stepped = VestingCurve::Stepped(250);
+    assert_eq!(vested_amount_for_curve(&stepped, total, 249, duration).unwrap(), 0);
+    assert_eq!(vested_amount_for_curve(&stepped, total, 250, duration).unwrap(), 250_000);
+    assert_eq!(vested_amount_for_curve(&stepped, total, 749, duration).unwrap(), 500_000);
+    assert_eq!(vested_amount_for_curve(&stepped, total, 750, duration).unwrap(), 750_000);
+    assert_eq!(vested_amount_for_curve(&stepped, total, duration, duration).unwrap(), total);
+
+    // Storage roundtrip defaults to Linear and persists configured curve.
+    let s = Setup::new(100, 3600, false);
+    s.env.as_contract(&s.client.address, || {
+        assert_eq!(get_vesting_curve(&s.env), VestingCurve::Linear);
+        set_vesting_curve(&s.env, &exp_curve);
+        assert_eq!(get_vesting_curve(&s.env), exp_curve);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Distinct InvalidCliffDuration error (#884)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn set_cliff_returns_invalid_cliff_duration_outside_stream_bounds() {
+    let s = Setup::new(100, 1_000, false);
+    let info = s.client.info();
+
+    // Cliff before start_time -> InvalidCliffDuration
+    assert_eq!(
+        s.client.try_set_cliff(&s.sender, &(info.start_time - 1), &100),
+        Err(Ok(Error::InvalidCliffDuration))
+    );
+
+    // Cliff after end_time -> InvalidCliffDuration
+    assert_eq!(
+        s.client.try_set_cliff(&s.sender, &(info.end_time + 1), &100),
+        Err(Ok(Error::InvalidCliffDuration))
+    );
+
+    // Cliff within [start_time, end_time] succeeds
+    assert!(s
+        .client
+        .try_set_cliff(&s.sender, &(info.start_time + 100), &100)
+        .is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// Fuzz & property-based extreme duration edge cases (#885)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fuzz_extreme_stream_durations_and_arbitrary_tuples() {
+    use crate::state::{vested_amount_for_curve, VestingCurve};
+    use crate::storage::StreamInfo;
+
+    const ONE_SECOND: u64 = 1;
+    const HUNDRED_YEARS: u64 = 100 * 365 * 86_400;
+
+    let env = Env::default();
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // 1. Explicit boundary duration cases: 1s, 100 years, and near u64::MAX
+    let boundary_cases: &[(u64, u64, i128)] = &[
+        (0, ONE_SECOND, 1),
+        (1_000, 1_000 + ONE_SECOND, 1_000_000_000_000),
+        (1_700_000_000, 1_700_000_000 + HUNDRED_YEARS, 10_000_000_000_000_000_000),
+        (u64::MAX - 10, u64::MAX, 500_000_000),
+        (u64::MAX - HUNDRED_YEARS, u64::MAX, i128::MAX / 4),
+    ];
+
+    let curves = [
+        VestingCurve::Linear,
+        VestingCurve::ExponentialDecay(2_500),
+        VestingCurve::ExponentialDecay(10_000),
+        VestingCurve::Stepped(1),
+        VestingCurve::Stepped(86_400),
+    ];
+
+    for &(start, stop, deposit) in boundary_cases {
+        let duration = stop.saturating_sub(start);
+        let info = StreamInfo {
+            sender: sender.clone(),
+            recipient: recipient.clone(),
+            token: token.clone(),
+            rate_per_second: 1,
+            start_time: start,
+            end_time: stop,
+            withdrawn: 0,
+            paused_at: 0,
+            flags: 0,
+            event_sequence: 0,
+            cumulative_fees: 0,
+        };
+
+        assert_eq!(info.elapsed_seconds(start), 0);
+        assert_eq!(info.elapsed_seconds(stop), duration);
+        assert_eq!(info.elapsed_seconds(u64::MAX), duration);
+
+        for curve in &curves {
+            let v0 = vested_amount_for_curve(curve, deposit, 0, duration).unwrap();
+            let v_mid = vested_amount_for_curve(curve, deposit, duration / 2, duration).unwrap();
+            let v_end = vested_amount_for_curve(curve, deposit, duration, duration).unwrap();
+            let v_over = vested_amount_for_curve(curve, deposit, u64::MAX, duration).unwrap();
+            assert_eq!(v0, 0);
+            assert!(v_mid >= 0 && v_mid <= deposit);
+            assert_eq!(v_end, deposit);
+            assert_eq!(v_over, deposit);
+        }
+    }
+
+    // 2. Deterministic PRNG fuzz over 500 arbitrary (start, stop, cliff, deposit) tuples
+    let mut seed: u64 = 0x5EED_CAFE_BABE_1337;
+    let mut next_u64 = || -> u64 {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+
+    for _ in 0..500 {
+        let start = next_u64() % (u64::MAX - HUNDRED_YEARS - 1);
+        let duration = match next_u64() % 4 {
+            0 => ONE_SECOND,
+            1 => 1 + (next_u64() % 86_400),
+            2 => 1 + (next_u64() % HUNDRED_YEARS),
+            _ => (u64::MAX - start).max(1),
+        };
+        let stop = start.saturating_add(duration);
+        let effective_duration = stop.saturating_sub(start);
+        let cliff = start.saturating_add(next_u64() % effective_duration.saturating_add(1));
+        assert!(cliff >= start && cliff <= stop);
+
+        let deposit = ((next_u64() as i128) % 10_000_000_000_000).max(1);
+        let t1 = next_u64() % effective_duration.saturating_add(1);
+        let t2 = t1.saturating_add(next_u64() % (effective_duration - t1).saturating_add(1));
+
+        for curve in &curves {
+            let v1 = vested_amount_for_curve(curve, deposit, t1, effective_duration).unwrap();
+            let v2 = vested_amount_for_curve(curve, deposit, t2, effective_duration).unwrap();
+            assert!(v1 >= 0 && v1 <= deposit, "v1 out of bounds");
+            assert!(v2 >= 0 && v2 <= deposit, "v2 out of bounds");
+            assert!(v1 <= v2, "monotonicity violated for {curve:?}: v({t1})={v1} > v({t2})={v2}");
+        }
+    }
+}
